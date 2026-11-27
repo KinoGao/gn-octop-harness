@@ -86,7 +86,7 @@ def _output_schema_text(tool_name: str, error: RuntimeError) -> str:
     return f"MCP tool `{tool_name}` failed output-schema validation: {_clip(str(error))}\n\n{_OUTPUT_NOTE}"
 
 
-def _tool_message(request: ToolCallRequest, content: str) -> ToolMessage:
+def _tool_message(request: ToolCallRequest, content: str, *, outcome: str = "error") -> ToolMessage:
     tool_call = request.tool_call
     tool_name = str(tool_call.get("name") or "")
     return ToolMessage(
@@ -94,6 +94,7 @@ def _tool_message(request: ToolCallRequest, content: str) -> ToolMessage:
         name=tool_name,
         tool_call_id=str(tool_call.get("id") or ""),
         status="error",
+        artifact={"outcome": outcome},
     )
 
 
@@ -112,7 +113,7 @@ def _soften(request: ToolCallRequest, exc: BaseException) -> ToolMessage | None:
             tool_name,
             str(schema_error)[:500],
         )
-        return _tool_message(request, _output_schema_text(tool_name, schema_error))
+        return _tool_message(request, _output_schema_text(tool_name, schema_error), outcome="outcome_unknown")
     return None
 
 

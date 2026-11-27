@@ -161,6 +161,40 @@ Hosts can use `MemoryMiddleware.pause_background(timeout=120)` as a context mana
 
 Ordinary memory runtime shutdown stops accepting background work immediately and returns without waiting. The runtime retains its shared database claim until all accepted workers finish, including workers from middleware replaced during configuration changes. With no pending work, resources are released immediately. `MemoryMiddleware.shutdown(on_idle=callback)` lets resource owners receive the same completion signal; the callback runs once outside the worker lock, immediately when idle or on the last worker's thread. Shutdown does not keep the process alive; hosts that need to await workers should drain them before exiting.
 
+#### Task progress and verification
+
+`HarnessAgent` installs `TaskReliabilityMiddleware` by default. Its
+`task_checkpoint(goal, status, next_step, blocker, evidence)` tool saves a
+thread's current goal and next action in graph state, so the model can resume
+after authorization, message compaction, or rebuilding the graph with the same
+persistent checkpointer and thread ID. Progress and recent tool observations
+are supplied in a request-only turn note alongside the filtered tool inventory.
+
+Marking a checkpoint `completed` requires real successful verification
+`tool_call_id` values from the current user turn, after the latest mutation.
+Reads, explicitly read-only tools, and successful `execute` checks qualify;
+time lookups and an empty connector inventory do not. This validates evidence
+provenance and ordering, not whether a result meets the user's intent, and does
+not prevent a model from making an unsupported claim in its final text.
+
+Identical failed calls execute at most twice per user turn. Authorization,
+permission, rate-limit, and uncertain results stop after one failure. An
+uncertain mutation remains blocked across turns until a later successful
+inspection in the same scope; connector scopes are separated by `server_name`.
+The runtime never automatically retries a tool. Parallel calls in the same
+batch share their input state, so these limits apply to subsequent batches.
+
+State keeps the latest 64 progress records and 64 observations. Recovery is
+bounded by that retained state and the checkpointer's durability: the default
+`exit` mode can lose an unfinished turn on process termination. This is not a
+durable job queue or a transaction across external services.
+
+Run `uv run python examples/13_task_reliability_eval.py` for six offline,
+scripted runtime scenarios. The JSON report includes pass rate, retained tool
+results, executions, blocked replays, simulated user interventions, and elapsed
+time. No paid model is used; token usage and cost are `null`. This is a runtime
+contract check, not a benchmark of real model task success.
+
 #### Tools & skills
 - Built-in tools: browser (octop-browser), web search, files, ``ask_user_question`` for
   respond-only human decisions, optional provider-neutral image/video generation, sub-agents,

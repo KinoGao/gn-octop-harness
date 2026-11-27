@@ -1557,11 +1557,11 @@ class HarnessAgent:
         """Assemble the middleware chain in declared execution order.
 
         Order: bootstrap (front-loaded) → router → model_settings → session_header →
-        skill_filter → mcp_tool_error → tool_guard → filesystem_guard (outside-root
+        skill_filter → tool_guard → filesystem_guard (outside-root
         soft-fail; deny rules when permissions + execution backend) → mcp_tools →
         retry → pii → media_offload → checkpoint_ts → memory → user middleware → team →
-        conversation_mode → tools_filter → decision (only when enabled) → tool search →
-        task tool ordering → refusal passthrough → context_usage.
+        conversation_mode → tools_filter → task_reliability → mcp_tool_error →
+        decision (only when enabled) → tool search → task tool ordering → refusal passthrough → context_usage.
 
         ``RefusalPassthroughMiddleware`` replaces deepagents' tail
         ``ModelRefusalMiddleware`` by name, so it runs innermost regardless of
@@ -1580,7 +1580,6 @@ class HarnessAgent:
             ModelSettingsMiddleware(),
             SessionHeaderMiddleware(),
             SkillFilterMiddleware(config=cfg),
-            McpToolErrorMiddleware(),
         ]
 
         if cfg.tool_guard_enabled:
@@ -1683,6 +1682,11 @@ class HarnessAgent:
 
         chain.append(ConversationModeMiddleware())
         chain.append(ToolsFilterMiddleware(config=cfg))
+
+        from octop_harness.middleware.task_reliability import TaskReliabilityMiddleware
+
+        chain.append(TaskReliabilityMiddleware())
+        chain.append(McpToolErrorMiddleware())
 
         from octop_harness.decision import decision_active
 

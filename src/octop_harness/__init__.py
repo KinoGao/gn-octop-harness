@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from octop_harness.init import InitResult, init_workspace
     from octop_harness.manager import AgentEntry, HarnessAgentManager
     from octop_harness.mcp_client import ManagedMCPClient
+    from octop_harness.middleware.task_reliability import TaskReliabilityMiddleware
     from octop_harness.observability.logging import (
         current_log_file,
         default_log_dir,
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
     from octop_harness.providers import ModelPreset, ProviderPreset
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "TaskReliabilityMiddleware": ("octop_harness.middleware.task_reliability", "TaskReliabilityMiddleware"),
     "ManagedMCPClient": ("octop_harness.mcp_client", "ManagedMCPClient"),
     "AgentEntry": ("octop_harness.manager", "AgentEntry"),
     "HarnessAgentManager": ("octop_harness.manager", "HarnessAgentManager"),
@@ -75,6 +77,7 @@ __all__ = [
     "ProviderConfig",
     "ProviderPreset",
     "SecurityPolicy",
+    "TaskReliabilityMiddleware",
     "__version__",
     "current_log_file",
     "default_log_dir",

@@ -14,7 +14,7 @@ from uuid import uuid4
 
 import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage, message_to_dict
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage, message_to_dict
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 from octop_memory import Memory
@@ -23,6 +23,7 @@ from pydantic import PrivateAttr
 from octop_harness.agent import HarnessAgent
 from octop_harness.config import HarnessAgentConfig, ModelConfig, ProviderConfig
 from octop_harness.llm.factory import ChatModelFactory
+from octop_harness.middleware.turn_note import is_turn_note
 from octop_harness.request import ChatRequest
 
 pytestmark = pytest.mark.filterwarnings("ignore:Direct attribute assignment to ModelRequest.model:DeprecationWarning")
@@ -55,8 +56,8 @@ class ProbeModel(BaseChatModel):
     async def _agenerate(
         self, messages: list[BaseMessage], stop: Any = None, run_manager: Any = None, **kwargs: Any
     ) -> ChatResult:
-        self._inputs.append([_message(message) for message in messages])
-        last = messages[-1]
+        self._inputs.append([_message(message) for message in messages if not is_turn_note(message)])
+        last = next(message for message in reversed(messages) if not is_turn_note(message))
         text = str(last.text)
         if isinstance(last, ToolMessage):
             parts = last.tool_call_id.split("-")
@@ -196,7 +197,13 @@ async def open_probe(
 
 
 def request(thread_id: str, text: str) -> ChatRequest:
-    return ChatRequest(messages=text, thread_id=thread_id, user="1", source="dashboard", recursion_limit=512)
+    return ChatRequest(
+        messages=[HumanMessage(content=text, id=f"{thread_id}:{text}")],
+        thread_id=thread_id,
+        user="1",
+        source="dashboard",
+        recursion_limit=512,
+    )
 
 
 async def state(agent: HarnessAgent, thread_id: str) -> dict[str, Any]:
