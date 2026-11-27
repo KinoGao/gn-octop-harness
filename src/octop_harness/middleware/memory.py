@@ -49,6 +49,7 @@ from octop_harness.middleware.memory_recall import (
     replay_recall_snapshots,
     stamp_recall_snapshot,
 )
+from octop_harness.middleware.turn_note import is_synthetic_human_message
 
 # ~20MB at the default 4KB page size. Matches
 # octop_memory.pipeline.lifecycle.vacuum.MAINTENANCE_INCREMENTAL_VACUUM_PAGES.
@@ -482,6 +483,7 @@ class MemoryMiddleware(AgentMiddleware[Any, Any]):
                 and self._recall_inject_enabled
                 and messages
                 and isinstance(messages[-1], HumanMessage)
+                and not is_synthetic_human_message(messages[-1])
                 and not has_recall_snapshot(messages[-1])
             ):
                 manual_context = {
@@ -1404,6 +1406,8 @@ def _find_turn_trigger_user(messages: list[BaseMessage], cursor: int) -> BaseMes
     """
     for msg in reversed(messages[:cursor]):
         if isinstance(msg, HumanMessage):
+            if is_synthetic_human_message(msg):
+                continue
             return msg
         if isinstance(msg, AIMessage) and not (getattr(msg, "tool_calls", None) or []):
             # Previous turn's closing reply — this turn has no user prompt.
@@ -1445,6 +1449,8 @@ def _filter_visible_messages(
     runtime_failure = False
     for msg in messages:
         if isinstance(msg, HumanMessage):
+            if is_synthetic_human_message(msg):
+                continue
             visible.append(msg)
         elif isinstance(msg, AIMessage):
             tool_calls = getattr(msg, "tool_calls", None) or []

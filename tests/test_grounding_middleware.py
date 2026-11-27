@@ -197,3 +197,91 @@ async def test_image_result_is_evidence_not_an_empty_result() -> None:
     produced = await _call(middleware, request)
 
     assert "no usable evidence" not in str(produced.content)
+
+
+@pytest.mark.asyncio
+async def test_json_error_payload_is_not_corrupted_and_preserves_reliability_guard() -> None:
+    import json
+
+    from langchain_core.messages import HumanMessage
+    from langgraph.types import Command
+
+    from octop_harness.middleware.task_reliability import TaskReliabilityMiddleware
+
+    grounding = GroundingMiddleware()
+    reliability = TaskReliabilityMiddleware()
+    payload = json.dumps({"status": "authorization_required", "code": "authorization_required", "message": "auth"})
+    err = ToolMessage(content=payload, tool_call_id="call-1", status="error")
+    req = ToolCallRequest(
+        tool_call={"name": "connector_call", "args": {"server_name": "fc"}, "id": "call-1", "type": "tool_call"},
+        tool=None,
+        state={"messages": [HumanMessage(content="run", id="u1")], "tool_observations": {}},
+        runtime=None,  # type: ignore[arg-type]
+    )
+
+    # Mirrors agent.py ordering: GroundingMiddleware outer -> TaskReliabilityMiddleware inner.
+    first = await grounding.awrap_tool_call(
+        req,
+        lambda r: reliability.awrap_tool_call(r, AsyncMock(return_value=err)),
+    )
+    assert isinstance(first, Command)
+    assert first.update is not None
+    obs = first.update["tool_observations"]["call-1"]
+    assert obs["outcome"] == "authorization_required"
+    msg = first.update["messages"][0]
+    assert json.loads(msg.content)["status"] == "authorization_required"
+
+    # Second identical call must be blocked immediately by TaskReliabilityMiddleware.
+    req2 = ToolCallRequest(
+        tool_call={"name": "connector_call", "args": {"server_name": "fc"}, "id": "call-2", "type": "tool_call"},
+        tool=None,
+        state={"messages": [HumanMessage(content="run", id="u1")], "tool_observations": {"call-1": obs}},
+        runtime=None,  # type: ignore[arg-type]
+    )
+    second = await grounding.awrap_tool_call(
+        req2,
+        lambda r: reliability.awrap_tool_call(r, AsyncMock(return_value=err)),
+    )
+    assert isinstance(second, ToolMessage)
+    assert "repeated_call_blocked" in str(second.content)
+
+
+@pytest.mark.asyncio
+async def test_multimodal_list_error_preserves_media_blocks() -> None:
+    middleware = GroundingMiddleware()
+    image_block = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}
+    request = _request("browser_use", "")
+    request._result = ToolMessage(  # type: ignore[attr-defined]
+        content=[image_block, {"type": "text", "text": "click failed"}],
+        tool_call_id="call-1",
+        status="error",
+    )
+
+    produced = await _call(middleware, request)
+
+    assert isinstance(produced.content, list)
+    assert produced.content[0] == image_block
+    assert any(
+        isinstance(b, dict) and b.get("type") == "text" and NO_EVIDENCE_NOTICE.strip() in str(b.get("text"))
+        for b in produced.content
+    )
+
+
+@pytest.mark.asyncio
+async def test_command_wrapped_write_receives_stale_read_notice() -> None:
+    from langgraph.types import Command
+
+    middleware = GroundingMiddleware()
+    await _call(middleware, _request("read_file", "old"))
+
+    write_req = _request("write_file", "ok")
+    cmd = Command(
+        update={
+            "messages": [ToolMessage(content="ok", tool_call_id="call-1")],
+            "tool_observations": {"call-1": {"outcome": "success"}},
+        }
+    )
+    out = await middleware.awrap_tool_call(write_req, AsyncMock(return_value=cmd))
+    assert isinstance(out, Command)
+    assert out.update is not None
+    assert "stale" in str(out.update["messages"][0].content)

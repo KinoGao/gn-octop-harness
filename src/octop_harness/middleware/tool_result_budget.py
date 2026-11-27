@@ -96,10 +96,53 @@ class ToolResultBudgetMiddleware(AgentMiddleware[Any, Any]):
     def _apply(
         self,
         request: ToolCallRequest,
-        result: ToolMessage | Command[Any],
+        result: Any,
     ) -> ToolMessage | Command[Any]:
-        if self._max_tokens <= 0 or not isinstance(result, ToolMessage):
+        if self._max_tokens <= 0:
+            return result  # type: ignore[no-any-return]
+        if isinstance(result, Command):
+            return self._apply_command(request, result)
+        if not isinstance(result, ToolMessage):
+            return result  # type: ignore[no-any-return]
+        return self._apply_message(request, result)
+
+    def _apply_command(self, request: ToolCallRequest, result: Command[Any]) -> Command[Any]:
+        if result.graph is not None or not isinstance(result.update, dict):
             return result
+        raw_messages = result.update.get("messages")
+        call_id = str(request.tool_call.get("id") or "")
+        if isinstance(raw_messages, ToolMessage):
+            updated = self._apply_message(request, raw_messages)
+            if updated is raw_messages:
+                return result
+            return Command(
+                update={**result.update, "messages": updated},
+                goto=result.goto,
+                resume=result.resume,
+                graph=result.graph,
+            )
+        if not isinstance(raw_messages, list):
+            return result
+        new_messages = list(raw_messages)
+        changed = False
+        for idx in range(len(new_messages) - 1, -1, -1):
+            msg = new_messages[idx]
+            if isinstance(msg, ToolMessage) and (not call_id or msg.tool_call_id == call_id):
+                updated = self._apply_message(request, msg)
+                if updated is not msg:
+                    new_messages[idx] = updated
+                    changed = True
+                break
+        if not changed:
+            return result
+        return Command(
+            update={**result.update, "messages": new_messages},
+            goto=result.goto,
+            resume=result.resume,
+            graph=result.graph,
+        )
+
+    def _apply_message(self, request: ToolCallRequest, result: ToolMessage) -> ToolMessage:
         content = result.content
         if not isinstance(content, str):
             return result

@@ -22,6 +22,7 @@ cross-contaminate each other.
 
 from __future__ import annotations
 
+import json
 import logging
 import posixpath
 from collections import OrderedDict
@@ -89,6 +90,24 @@ def _has_media_block(content: Any) -> bool:
     return any(isinstance(block, dict) and block.get("type") != "text" for block in content)
 
 
+def _is_json_object(text: str) -> bool:
+    """True when *text* is a valid JSON object payload (must not be corrupted with prose)."""
+    stripped = text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return False
+    try:
+        return isinstance(json.loads(stripped), dict)
+    except (ValueError, TypeError):
+        return False
+
+
+def _append_notice(content: Any, text: str, appended: str) -> Any:
+    """Append *appended* without dropping non-text content blocks."""
+    if isinstance(content, list):
+        return [*content, {"type": "text", "text": appended}]
+    return f"{text}{appended}"
+
+
 def _thread_key(request: ToolCallRequest) -> str:
     runtime = getattr(request, "runtime", None)
     cfg = getattr(runtime, "config", None)
@@ -131,29 +150,69 @@ class GroundingMiddleware(AgentMiddleware[Any, Any]):
     def _annotate(
         self,
         request: ToolCallRequest,
-        result: ToolMessage | Command[Any],
+        result: Any,
     ) -> ToolMessage | Command[Any]:
+        if isinstance(result, Command):
+            return self._annotate_command(request, result)
         if not isinstance(result, ToolMessage):
-            return result
+            return result  # type: ignore[no-any-return]
+        return self._annotate_message(request, result)
 
+    def _annotate_command(self, request: ToolCallRequest, result: Command[Any]) -> Command[Any]:
+        if result.graph is not None or not isinstance(result.update, dict):
+            return result
+        raw_messages = result.update.get("messages")
+        call_id = str(request.tool_call.get("id") or "")
+        if isinstance(raw_messages, ToolMessage):
+            updated = self._annotate_message(request, raw_messages)
+            if updated is raw_messages:
+                return result
+            return Command(
+                update={**result.update, "messages": updated},
+                goto=result.goto,
+                resume=result.resume,
+                graph=result.graph,
+            )
+        if not isinstance(raw_messages, list):
+            return result
+        new_messages = list(raw_messages)
+        changed = False
+        for idx in range(len(new_messages) - 1, -1, -1):
+            msg = new_messages[idx]
+            if isinstance(msg, ToolMessage) and (not call_id or msg.tool_call_id == call_id):
+                updated = self._annotate_message(request, msg)
+                if updated is not msg:
+                    new_messages[idx] = updated
+                    changed = True
+                break
+        if not changed:
+            return result
+        return Command(
+            update={**result.update, "messages": new_messages},
+            goto=result.goto,
+            resume=result.resume,
+            graph=result.graph,
+        )
+
+    def _annotate_message(self, request: ToolCallRequest, result: ToolMessage) -> ToolMessage:
         tool_name = str(request.tool_call.get("name") or "")
         raw_params = request.tool_call.get("args") or {}
         params: dict[str, Any] = raw_params if isinstance(raw_params, dict) else {}
 
         notices = self._track(_thread_key(request), tool_name, params, result)
-        empty = not _content_text(result.content).strip() and not _has_media_block(result.content)
-        if result.status == "error" or empty:
+        text = _content_text(result.content)
+        empty = not text.strip() and not _has_media_block(result.content)
+        if empty or (result.status == "error" and not _is_json_object(text)):
             notices.append(NO_EVIDENCE_NOTICE)
 
         if not notices:
             return result
 
-        text = _content_text(result.content)
         appended = "".join(notice for notice in notices if notice.strip() not in text)
         if not appended:
             return result
         logger.debug("GroundingMiddleware annotated %s result", tool_name)
-        return result.model_copy(update={"content": f"{text}{appended}"})
+        return result.model_copy(update={"content": _append_notice(result.content, text, appended)})
 
     def _track(self, thread_key: str, tool_name: str, params: dict[str, Any], result: ToolMessage) -> list[str]:
         """Maintain the per-thread read ledger; return a stale notice when one applies."""

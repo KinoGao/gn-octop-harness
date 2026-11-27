@@ -180,10 +180,32 @@ async def test_empty_spill_dir_drops_the_middle_silently() -> None:
 
 
 def test_truncate_head_tail_handles_utf8_and_short_budget() -> None:
-    text = "港能助手" * 20_000
+    text = "项目助手" * 20_000
     out = _truncate_head_tail(text, max_tokens=20, original_tokens=20_000, spill_path=None)
     assert out
     assert "omitted" in out
+
+
+def test_budget_truncates_tool_message_inside_command() -> None:
+    from langgraph.types import Command
+
+    mw = ToolResultBudgetMiddleware(max_tokens=100)
+    huge = "A" * 5000 + "B" * 5000
+    cmd = Command(
+        update={
+            "messages": [ToolMessage(content=huge, tool_call_id="c-cmd")],
+            "tool_observations": {"c-cmd": {"outcome": "success"}},
+        }
+    )
+    req = _request(tool="web_fetch", call_id="c-cmd")
+    out = mw.wrap_tool_call(req, lambda _r: cmd)
+    assert isinstance(out, Command)
+    assert out.update is not None
+    assert out.update["tool_observations"] == {"c-cmd": {"outcome": "success"}}
+    msg = out.update["messages"][0]
+    assert isinstance(msg, ToolMessage)
+    assert "omitted" in msg.content
+    assert len(msg.content) < len(huge)
 
 
 @pytest.mark.parametrize(

@@ -1733,7 +1733,9 @@ class HarnessAgent:
 
         items.append(ConversationModeMiddleware())
         items.append(ToolsFilterMiddleware(config=cfg))
-        items.append(TaskReliabilityMiddleware())
+        # Grounding and tool-result budgeting wrap outside TaskReliabilityMiddleware
+        # so TaskReliabilityMiddleware always inspects raw, untruncated, unannotated
+        # ToolMessages before budget truncation or grounding notices run.
         if cfg.grounding_enabled:
             items.append(GroundingMiddleware())
         if cfg.tool_result_max_tokens > 0:
@@ -1744,6 +1746,7 @@ class HarnessAgent:
                     workspace=self._workspace,
                 )
             )
+        items.append(TaskReliabilityMiddleware())
         items.append(McpToolErrorMiddleware())
         return items
 

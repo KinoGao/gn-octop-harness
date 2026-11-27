@@ -16,7 +16,7 @@ from typing import Any, cast
 from langchain_core.messages import AIMessage, AnyMessage, BaseMessage, HumanMessage
 from langchain_core.messages.utils import MessageLikeRepresentation, convert_to_messages, count_tokens_approximately
 
-from octop_harness.middleware.turn_note import is_turn_note
+from octop_harness.middleware.turn_note import is_synthetic_human_message
 
 RECALL_SNAPSHOT_KEY = "_octop_memory_recall"
 _CONTEXT_PREFIX_BUDGET = 240
@@ -58,7 +58,7 @@ def build_recall_query(messages: Sequence[BaseMessage]) -> str:
     snippets: list[str] = []
     used = 0
     for msg in reversed(messages[:-1]):
-        if not isinstance(msg, (HumanMessage, AIMessage)) or is_turn_note(msg):
+        if not isinstance(msg, (HumanMessage, AIMessage)) or is_synthetic_human_message(msg):
             continue
         text = " ".join(_message_text(msg.content).split())
         if not text:

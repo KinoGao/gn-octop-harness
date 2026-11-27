@@ -30,6 +30,7 @@ ConversationMode = Literal["ask", "plan", "craft"]
 
 CONFIG_MODE_KEY = "conversation_mode"
 CONFIG_EXTRA_READ_KEY = "conversation_mode_extra_read_tools"
+CONFIG_ALLOW_READONLY_MCP_KEY = "allow_readonly_mcp_in_restricted_modes"
 
 DEFAULT_CONVERSATION_MODE: ConversationMode = "craft"
 _VALID_MODES: frozenset[str] = frozenset({"ask", "plan", "craft"})
@@ -104,6 +105,10 @@ def extra_read_tools(configurable: dict[str, Any] | None) -> frozenset[str]:
     if not isinstance(raw, list):
         return frozenset()
     return frozenset(str(name).strip() for name in raw if str(name).strip())
+
+
+def allow_readonly_mcp_tools(configurable: dict[str, Any] | None) -> bool:
+    return bool((configurable or {}).get(CONFIG_ALLOW_READONLY_MCP_KEY) is True)
 
 
 def allowed_tool_names(
@@ -209,8 +214,11 @@ def apply_conversation_mode_to_request(request: ModelRequest[Any]) -> ModelReque
     out = request
     if mode != "craft":
         allowed = allowed_tool_names(mode, extra_read=extra_read_tools(configurable))
+        allow_ro = allow_readonly_mcp_tools(configurable)
         tools_in = list(request.tools or [])
-        filtered = [t for t in tools_in if _tool_base_name(_tool_name(t)) in allowed or is_readonly_tool(t)]
+        filtered = [
+            t for t in tools_in if _tool_base_name(_tool_name(t)) in allowed or (allow_ro and is_readonly_tool(t))
+        ]
         if len(filtered) != len(tools_in):
             out = out.override(tools=filtered)
         out = _clear_skills_metadata(out)
@@ -309,7 +317,7 @@ class ConversationModeMiddleware(AgentMiddleware[Any, Any]):
             args=args,
             mode=mode,
             extra_read=extra_read_tools(configurable),
-            readonly_tool=is_readonly_tool(request.tool),
+            readonly_tool=allow_readonly_mcp_tools(configurable) and is_readonly_tool(request.tool),
         )
         if blocked is None:
             return None

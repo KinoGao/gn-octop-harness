@@ -1861,6 +1861,6 @@ def test_phase1_intelligence_defaults_wiring_and_config_roundtrip(
 
     assert render_execution_discipline_prompt(language="zh") in prompt
     assert mw_names.index("DeferredSummarizationToolMiddleware") < mw_names.index("ConversationModeMiddleware")
-    assert mw_names.index("TaskReliabilityMiddleware") < mw_names.index("GroundingMiddleware")
     assert mw_names.index("GroundingMiddleware") < mw_names.index("ToolResultBudgetMiddleware")
-    assert mw_names.index("ToolResultBudgetMiddleware") < mw_names.index("McpToolErrorMiddleware")
+    assert mw_names.index("ToolResultBudgetMiddleware") < mw_names.index("TaskReliabilityMiddleware")
+    assert mw_names.index("TaskReliabilityMiddleware") < mw_names.index("McpToolErrorMiddleware")

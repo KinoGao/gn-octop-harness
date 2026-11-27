@@ -17,11 +17,20 @@ from langchain_core.messages import HumanMessage
 
 _MARKERS = ("[本轮说明]", "[turn note]")
 _TURN_NOTE_KEY = "_octop_turn_note"
+_INTERNAL_HUMAN_SOURCES = frozenset({"rubric_grader", "summarization"})
 
 
 def is_turn_note(message: Any) -> bool:
     kwargs = getattr(message, "additional_kwargs", None)
     return isinstance(kwargs, dict) and kwargs.get(_TURN_NOTE_KEY) is True
+
+
+def is_synthetic_human_message(message: Any) -> bool:
+    """True for harness/framework-injected HumanMessages (turn notes, rubric grader, summaries)."""
+    if is_turn_note(message):
+        return True
+    kwargs = getattr(message, "additional_kwargs", None)
+    return isinstance(kwargs, dict) and kwargs.get("lc_source") in _INTERNAL_HUMAN_SOURCES
 
 
 def _turn_note_message(content: str) -> HumanMessage:
@@ -55,7 +64,7 @@ def insert_turn_note(messages: Sequence[Any], content: str) -> list[Any]:
     user_at: int | None = None
     for index in range(len(out) - 1, -1, -1):
         msg = out[index]
-        if isinstance(msg, HumanMessage) and not is_turn_note(msg):
+        if isinstance(msg, HumanMessage) and not is_synthetic_human_message(msg):
             user_at = index
             break
     if user_at is None:

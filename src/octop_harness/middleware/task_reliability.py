@@ -18,7 +18,7 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from octop_harness.middleware.turn_note import insert_turn_note, is_turn_note
+from octop_harness.middleware.turn_note import insert_turn_note, is_synthetic_human_message
 
 _READ_TOOLS = frozenset(
     {
@@ -111,7 +111,7 @@ class _CheckpointInput(BaseModel):
 
 def _turn(state: Mapping[str, Any]) -> str:
     for message in reversed(state.get("messages", [])):
-        if isinstance(message, HumanMessage) and not is_turn_note(message):
+        if isinstance(message, HumanMessage) and not is_synthetic_human_message(message):
             return str(message.id or hashlib.sha256(message.text.encode()).hexdigest())
     return ""
 

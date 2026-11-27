@@ -170,16 +170,22 @@ def _restrict_ask_plan_config(
     *,
     allow_readonly_mcp: bool = False,
 ) -> None:
-    from octop_harness.middleware.conversation_mode import parse_conversation_mode
+    from octop_harness.middleware.conversation_mode import (
+        CONFIG_ALLOW_READONLY_MCP_KEY,
+        parse_conversation_mode,
+    )
 
     mode = parse_conversation_mode(configurable.get("conversation_mode"))
     if mode not in ("ask", "plan"):
         return
     configurable["conversation_mode"] = mode
     configurable["skills"] = []
-    if not allow_readonly_mcp:
+    if allow_readonly_mcp:
+        configurable[CONFIG_ALLOW_READONLY_MCP_KEY] = True
+    else:
         configurable["mcp_servers"] = []
         configurable.pop("mcp_use_default", None)
+        configurable.pop(CONFIG_ALLOW_READONLY_MCP_KEY, None)
 
 
 _ROLE_TO_MESSAGE: dict[str, type[BaseMessage]] = {

@@ -246,11 +246,15 @@ def test_subagent_inherits_only_readonly_mcp_with_guard_middleware_and_resolves_
 
 
 @pytest.mark.asyncio
-async def test_plan_mode_allows_readonly_mcp_and_blocks_mutating_mcp() -> None:
+async def test_plan_mode_allows_readonly_mcp_only_when_opted_in() -> None:
     ro = _mcp_tool("ding_search", annotation_hint=True)
     rw = _mcp_tool("ding_post")
     request = ModelRequest(model=MagicMock(), messages=[], tools=[ro, rw])
     with _configurable(conversation_mode="plan"):
+        default_out = apply_conversation_mode_to_request(request)
+    assert list(default_out.tools or []) == []
+
+    with _configurable(conversation_mode="plan", allow_readonly_mcp_in_restricted_modes=True):
         out = apply_conversation_mode_to_request(request)
     assert [getattr(t, "name", None) for t in (out.tools or [])] == ["ding_search"]
 
@@ -269,6 +273,11 @@ async def test_plan_mode_allows_readonly_mcp_and_blocks_mutating_mcp() -> None:
         runtime=None,  # type: ignore[arg-type]
     )
     with _configurable(conversation_mode="plan"):
+        default_blocked = await mw.awrap_tool_call(ro_call, AsyncMock(return_value=ok))
+    assert isinstance(default_blocked, ToolMessage)
+    assert default_blocked.status == "error"
+
+    with _configurable(conversation_mode="plan", allow_readonly_mcp_in_restricted_modes=True):
         assert await mw.awrap_tool_call(ro_call, AsyncMock(return_value=ok)) is ok
         blocked = await mw.awrap_tool_call(rw_call, AsyncMock(return_value=ok))
     assert isinstance(blocked, ToolMessage)
@@ -281,6 +290,7 @@ async def test_plan_mode_allows_readonly_mcp_and_blocks_mutating_mcp() -> None:
         allow_readonly_mcp_in_restricted_modes=True,
     ).to_runnable_config()
     assert cfg["configurable"]["mcp_servers"] == ["ding"]
+    assert cfg["configurable"]["allow_readonly_mcp_in_restricted_modes"] is True
     assert cfg["configurable"]["skills"] == []
 
 
@@ -291,12 +301,12 @@ async def test_plan_mode_allows_readonly_mcp_and_blocks_mutating_mcp() -> None:
 
 def test_build_recall_query_expands_anaphoric_or_short_followups() -> None:
     messages = [
-        HumanMessage(content="帮我整理港能助手本周的发版清单"),
+        HumanMessage(content="帮我整理项目助手本周的发版清单"),
         AIMessage(content="好的, 已经列出 1.0.4b5 的变更项。"),
         HumanMessage(content="按上次说的继续改一下"),
     ]
     expanded = build_recall_query(messages)
-    assert "港能助手" in expanded
+    assert "项目助手" in expanded
     assert "按上次说的继续改一下" in expanded
 
     standalone = HumanMessage(content="请详细分析 PostgreSQL 连接池在高并发下的超时参数配置以及最佳连接数计算公式。")
@@ -306,12 +316,12 @@ def test_build_recall_query_expands_anaphoric_or_short_followups() -> None:
 def test_deduplicate_recalled_text_drops_already_injected_memories() -> None:
     first = stamp_recall_snapshot(
         HumanMessage(content="hi"),
-        "## Memories\n- User prefers concise Chinese replies.\n- Deploy target is gangneng-smoke.",
+        "## Memories\n- User prefers concise Chinese replies.\n- Deploy target is staging-app.",
     )
     # Exact duplicate -> suppressed completely.
     assert (
         deduplicate_recalled_text(
-            "## Memories\n- User prefers concise Chinese replies.\n- Deploy target is gangneng-smoke.",
+            "## Memories\n- User prefers concise Chinese replies.\n- Deploy target is staging-app.",
             [first],
         )
         == ""
@@ -323,3 +333,22 @@ def test_deduplicate_recalled_text_drops_already_injected_memories() -> None:
     )
     assert "Primary branch is dev." in partial
     assert "concise Chinese replies" not in partial
+
+
+def test_rubric_grader_synthetic_message_ignored_by_turn_and_memory() -> None:
+    from octop_harness.middleware.memory import MemoryMiddleware
+    from octop_harness.middleware.task_reliability import _turn
+
+    user_msg = HumanMessage(content="build feature X", id="u1")
+    grader_msg = HumanMessage(
+        content="Revise criterion 2",
+        id="g1",
+        name="rubric_grader",
+        additional_kwargs={"lc_source": "rubric_grader"},
+    )
+    assert _turn({"messages": [user_msg, grader_msg]}) == "u1"
+
+    service = MagicMock()
+    mm = MemoryMiddleware(service=service, recall_inject_enabled=True, jsonl_enabled=False)
+    assert mm.before_model({"messages": [user_msg, grader_msg]}, MagicMock()) is None
+    service.recall.assert_not_called()
