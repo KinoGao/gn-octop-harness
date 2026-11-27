@@ -105,7 +105,7 @@ class TestCall:
 
         await protocol.call(messages, config)
 
-        graph.ainvoke.assert_awaited_once_with({"messages": messages}, config=config, durability="exit")
+        graph.ainvoke.assert_awaited_once_with({"messages": messages, "rubric": ""}, config=config, durability="exit")
 
 
 # ---------------------------------------------------------------------------
@@ -499,7 +499,7 @@ class TestStream:
             pass
 
         assert len(captured) == 1
-        assert captured[0] == ({"messages": messages},)
+        assert captured[0] == ({"messages": messages, "rubric": ""},)
         assert captured_kwargs[0] == {
             "config": config,
             "stream_mode": ["values", "updates", "messages", "custom"],
@@ -683,7 +683,7 @@ class TestStreamEvents:
 
         assert result is fake_stream
         graph.astream_events.assert_awaited_once_with(
-            {"messages": messages}, config=config, version="v3", durability="exit"
+            {"messages": messages, "rubric": ""}, config=config, version="v3", durability="exit"
         )
 
     @pytest.mark.asyncio
@@ -698,7 +698,7 @@ class TestStreamEvents:
         await protocol.stream_events([HumanMessage(content="hi")], {}, include_names=["agent"])
 
         graph.astream_events.assert_awaited_once_with(
-            {"messages": [HumanMessage(content="hi")]},
+            {"messages": [HumanMessage(content="hi")], "rubric": ""},
             config={},
             version="v3",
             include_names=["agent"],

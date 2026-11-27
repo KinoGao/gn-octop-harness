@@ -1378,6 +1378,9 @@ def _validate_intelligence_settings(config: HarnessAgentConfig) -> None:
         raise ValueError("defer_mcp_tools_threshold must be a non-negative int")
     if isinstance(config.tool_result_max_tokens, bool) or not isinstance(config.tool_result_max_tokens, int):
         raise ValueError("tool_result_max_tokens must be an int")
+    from octop_harness.middleware.tool_result_budget import validate_spill_dir
+
+    object.__setattr__(config, "tool_result_spill_dir", validate_spill_dir(config.tool_result_spill_dir))
     if not isinstance(config.grounding_enabled, bool):
         raise ValueError("grounding_enabled must be a bool")
     if not isinstance(config.summarization_tool_enabled, bool):

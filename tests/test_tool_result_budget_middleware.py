@@ -218,3 +218,89 @@ def test_budget_truncates_tool_message_inside_command() -> None:
 )
 def test_safe_stem(raw: str, expected: str) -> None:
     assert _safe_stem(raw) == expected
+
+
+@pytest.mark.asyncio
+async def test_list_text_blocks_are_truncated_while_media_blocks_survive() -> None:
+    mw = ToolResultBudgetMiddleware(max_tokens=100)
+    image_block: dict[str, Any] = {"type": "image", "base64": "A" * 50_000}
+    audio_block: dict[str, Any] = {"type": "audio", "data": "B" * 20_000}
+    huge_text = "HEAD-START\n" + ("payload " * 20_000) + "\nTAIL-END"
+    blocks: list[dict[str, Any]] = [
+        image_block,
+        {"type": "text", "text": huge_text, "annotations": [{"kind": "note"}]},
+        audio_block,
+    ]
+    handler = AsyncMock(return_value=ToolMessage(content=blocks, tool_call_id="call-list"))
+    result = await mw.awrap_tool_call(_request(tool="mcp_fetch", call_id="call-list"), handler)
+
+    assert isinstance(result, ToolMessage)
+    assert isinstance(result.content, list)
+    assert len(result.content) == 3
+    assert result.content[0] == image_block
+    assert result.content[2] == audio_block
+    text_block = result.content[1]
+    assert isinstance(text_block, dict)
+    assert text_block["type"] == "text"
+    assert text_block["annotations"] == [{"kind": "note"}]
+    assert estimate_tokens(text_block["text"]) <= 100
+    assert text_block["text"].startswith("HEAD-START")
+    assert text_block["text"].endswith("TAIL-END")
+    assert "omitted" in text_block["text"]
+
+
+@pytest.mark.asyncio
+async def test_awrap_tool_call_spills_via_awrite_text_without_blocking_event_loop() -> None:
+    written: dict[str, str] = {}
+
+    class _AsyncOnlyWorkspace:
+        def write_text(self, *_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("desktop relay backend cannot block the event loop; use the async API")
+
+        async def awrite_text(self, path: str, content: str, *, force: bool = True) -> None:
+            assert force is True
+            written[path] = content
+
+    mw = ToolResultBudgetMiddleware(
+        max_tokens=100,
+        spill_dir=".tool-outputs",
+        workspace=_AsyncOnlyWorkspace(),
+    )
+    body = "line\n" * 10_000
+    result = await _run(mw, content=body, tool="localfs_read", call_id="call-async")
+
+    assert isinstance(result.content, str)
+    assert ".tool-outputs/localfs_read-call-async.txt" in written
+    assert written[".tool-outputs/localfs_read-call-async.txt"] == body
+    assert ".tool-outputs/localfs_read-call-async.txt" in result.content
+
+
+@pytest.mark.parametrize(
+    "bad_dir",
+    [
+        "~/evil-spill",
+        "~",
+        "/tmp/evil-spill",
+        "../outside",
+        "sub/../outside",
+        ".",
+        "C:\\evil",
+    ],
+)
+def test_spill_dir_validation_rejects_unsafe_paths(tmp_path: Path, bad_dir: str) -> None:
+    from octop_harness.config import HarnessAgentConfig
+
+    with pytest.raises(ValueError, match="tool_result_spill_dir"):
+        ToolResultBudgetMiddleware(max_tokens=100, spill_dir=bad_dir)
+
+    with pytest.raises(ValueError, match="tool_result_spill_dir"):
+        HarnessAgentConfig(workspace_dir=tmp_path, tool_result_spill_dir=bad_dir)
+
+
+def test_spill_dir_validation_accepts_empty_and_workspace_relative_subpaths(tmp_path: Path) -> None:
+    from octop_harness.config import HarnessAgentConfig
+
+    assert ToolResultBudgetMiddleware(max_tokens=100, spill_dir="")._spill_dir == ""
+    assert ToolResultBudgetMiddleware(max_tokens=100, spill_dir=".tool-outputs/sub/")._spill_dir == ".tool-outputs/sub"
+    cfg = HarnessAgentConfig(workspace_dir=tmp_path, tool_result_spill_dir="cache/tool-outputs/")
+    assert cfg.tool_result_spill_dir == "cache/tool-outputs"

@@ -187,6 +187,7 @@ class ToolSearchMiddleware(AgentMiddleware[ClientToolSearchState, Any]):
                 coroutine=self._atool_search,
                 args_schema=ToolSearchInput,
                 infer_schema=False,
+                metadata={"read_only": True},
             )
         ]
         self.tools = client_tools if mode == "client" else []

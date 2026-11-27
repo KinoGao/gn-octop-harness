@@ -53,7 +53,10 @@ class ModelRouterMiddleware(AgentMiddleware[Any, Any]):
         request: ModelRequest,
         handler: Callable[[ModelRequest], ModelResponse],
     ) -> ModelResponse:
-        request.model = self._select_model(request)
+        model = self._select_model(request)
+        if hasattr(request, "override"):
+            return handler(request.override(model=model))
+        request.model = model
         return handler(request)
 
     async def awrap_model_call(
@@ -61,7 +64,10 @@ class ModelRouterMiddleware(AgentMiddleware[Any, Any]):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse:
-        request.model = self._select_model(request)
+        model = self._select_model(request)
+        if hasattr(request, "override"):
+            return await handler(request.override(model=model))
+        request.model = model
         return await handler(request)
 
     def _select_model(self, request: ModelRequest) -> Any:
@@ -92,6 +98,28 @@ class ModelRouterMiddleware(AgentMiddleware[Any, Any]):
         return ref
 
 
+class PinnedModelRouterMiddleware(AgentMiddleware[Any, Any]):
+    """No-op replacement for ``ModelRouterMiddleware`` on forked subagents with an explicit model."""
+
+    @property
+    def name(self) -> str:
+        return ModelRouterMiddleware.__name__
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        return handler(request)
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        return await handler(request)
+
+
 def _request_needs_multimodal(request: ModelRequest) -> bool:
     """Return True iff the latest user message contains non-text content."""
     return latest_human_needs_multimodal(list(request.messages or []))
@@ -100,4 +128,4 @@ def _request_needs_multimodal(request: ModelRequest) -> bool:
 # Back-compat alias for older tests / callers.
 _content_has_non_text = content_has_non_text
 
-__all__ = ["ModelRouterMiddleware"]
+__all__ = ["ModelRouterMiddleware", "PinnedModelRouterMiddleware"]

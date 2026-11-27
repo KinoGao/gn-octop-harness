@@ -1879,9 +1879,16 @@ class HarnessAgent:
         specs = merge_subagents(loaded, config_specs)
         mcp_names = self._mcp_tool_name_set
         server_names = frozenset(cfg.mcp_server_configs)
+        from octop_harness.middleware.model_router import ModelRouterMiddleware, PinnedModelRouterMiddleware
+
         for spec in specs:
             if "model" in spec:
                 spec["model"] = self._resolve_subagent_model(spec["model"])
+            if spec.get("mode") == "fork" and spec.get("model") is not None:
+                existing_fork_mw = list(spec.get("middleware") or [])
+                if not any(getattr(mw, "name", None) == ModelRouterMiddleware.__name__ for mw in existing_fork_mw):
+                    existing_fork_mw.append(PinnedModelRouterMiddleware())
+                    spec["middleware"] = existing_fork_mw
             # A subagent that omits ``tools:`` inherits the parent tool set; we
             # still resolve and reassign it so the gated set is pinned on the
             # spec instead of leaking the full compiled graph.

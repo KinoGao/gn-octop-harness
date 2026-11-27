@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 def _graph_input(messages: list[Any], config: dict[str, Any]) -> dict[str, Any]:
-    payload: dict[str, Any] = {"messages": messages}
+    payload: dict[str, Any] = {"messages": messages, "rubric": ""}
     configurable = config.get("configurable")
     if isinstance(configurable, dict):
         rubric = configurable.get("rubric")

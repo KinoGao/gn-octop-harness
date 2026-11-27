@@ -28,7 +28,7 @@ import os
 import threading
 import time
 import weakref
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -318,6 +318,11 @@ def _bg_pool() -> _BackgroundExecutor:
         return _BG_POOL
 
 
+def _is_forked_context(state: Any) -> bool:
+    """Return True when running inside a deepagents ``mode="fork"`` subagent."""
+    return isinstance(state, Mapping) and bool(state.get("_deepagents_forked_context"))
+
+
 class MemoryMiddleware(AgentMiddleware[Any, Any]):
     """Wire ``MemoryService`` / JSONL into the agent loop.
 
@@ -475,6 +480,8 @@ class MemoryMiddleware(AgentMiddleware[Any, Any]):
         and legacy history are never retroactively filled with today's memories.
         LangGraph's add_messages reducer replaces the stamped message by ID.
         """
+        if _is_forked_context(state):
+            return None
         try:
             messages = _extract_messages(state)
             self._cursors[threading.get_ident()] = len(messages)
@@ -533,6 +540,8 @@ class MemoryMiddleware(AgentMiddleware[Any, Any]):
         dropped. The full message stream still flows through JSONL when
         enabled.
         """
+        if _is_forked_context(state):
+            return
         try:
             messages = _extract_messages(state)
             cursor = self._cursors.pop(threading.get_ident(), 0)

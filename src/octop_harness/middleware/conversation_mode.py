@@ -52,6 +52,7 @@ ASK_READ_TOOLS: frozenset[str] = frozenset(
         "you_search",
         "current_time",
         "task_checkpoint",
+        "tool_search",
     }
 )
 PLAN_WRITE_TOOLS: frozenset[str] = frozenset({"write_file", "edit_file"})

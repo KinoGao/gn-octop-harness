@@ -90,8 +90,9 @@ class SnapshotSqliteSaver(SqliteSaver):
                         self._save(image)
                         self._image = image
             except BaseException:
-                self.failed = True
-                self.conn.rollback()
+                if transaction:
+                    self.failed = True
+                    self.conn.rollback()
                 raise
             finally:
                 cur.close()
