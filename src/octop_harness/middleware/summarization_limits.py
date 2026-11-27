@@ -13,21 +13,121 @@ import asyncio
 import logging
 import os
 import threading
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
+from deepagents.middleware.summarization import (
+    _MEDIA_REFERENCE_SUMMARY_PROMPT,
+    SummarizationToolMiddleware,
+)
+from langchain.tools import ToolRuntime
 from langchain_core.exceptions import ContextOverflowError
+from langchain_core.messages import ToolMessage
+from langgraph.types import Command
 
 logger = logging.getLogger(__name__)
 
 SUMMARY_INPUT_TOKEN_LIMIT = 8000
 SUMMARY_INPUT_RETRY_TOKEN_LIMIT = 4000
+SUMMARY_ADAPTIVE_MAX_TOKENS = 32_000
+SUMMARY_ADAPTIVE_FRACTION = 0.25
 SUMMARY_FALLBACK_KEEP = 20
 SUMMARY_FALLBACK_TEXT = (
     "The earlier conversation was too large to summarize. "
     "Older messages were saved to the history file. "
     "Continue from the recent messages and that file; do not repeat finished tool calls."
 )
+
+STRUCTURED_SUMMARY_PROMPT = (
+    "<role>\n"
+    "Context Extraction Assistant\n"
+    "</role>\n\n"
+    "<primary_objective>\n"
+    "Distill the earlier conversation history into a compact, high-signal working handoff "
+    "so the agent can continue seamlessly without losing constraints, verified facts, or progress.\n"
+    "</primary_objective>\n\n"
+    "<instructions>\n"
+    "Respond ONLY with the extracted summary using the exact sections below (omit empty bullets, "
+    "keep identifiers, file paths, commands, URLs, and error messages verbatim):\n\n"
+    "## Goal & Scope\n"
+    "- User's primary goal, explicit constraints, preferences, and acceptance criteria.\n\n"
+    "## Confirmed Facts & Key Files\n"
+    "- Verified findings from tools/files, key file paths, symbols, IDs, and environment details.\n\n"
+    "## Work Completed\n"
+    "- Completed edits, outputs, or actions and whether each was verified.\n\n"
+    "## Failed Attempts & Blockers\n"
+    "- Errors encountered, root causes identified, ruled-out approaches (do not repeat these), and open blockers.\n\n"
+    "## Remaining Next Steps\n"
+    "- Concrete unfinished tasks and the immediate next step.\n"
+    "</instructions>\n\n"
+    f"{_MEDIA_REFERENCE_SUMMARY_PROMPT}\n\n"
+    "<messages>\n"
+    "{messages}\n"
+    "</messages>"
+)
+
+
+def resolve_summary_input_token_limit(model: Any, configured_trim: int | None = None) -> int:
+    """Resolve the summarization input budget from config or the model's context window.
+
+    Explicit ``configured_trim`` always wins. Otherwise, models that expose a
+    large ``profile["max_input_tokens"]`` get up to 25% of their window
+    (clamped to ``[SUMMARY_INPUT_TOKEN_LIMIT, SUMMARY_ADAPTIVE_MAX_TOKENS]``)
+    so compaction preserves far more working context before falling back.
+    """
+    if isinstance(configured_trim, int) and not isinstance(configured_trim, bool) and configured_trim > 0:
+        return configured_trim
+    profile = getattr(model, "profile", None)
+    max_input = profile.get("max_input_tokens") if isinstance(profile, Mapping) else None
+    if isinstance(max_input, int) and not isinstance(max_input, bool) and max_input > 0:
+        adaptive = int(max_input * SUMMARY_ADAPTIVE_FRACTION)
+        return min(SUMMARY_ADAPTIVE_MAX_TOKENS, max(SUMMARY_INPUT_TOKEN_LIMIT, adaptive))
+    return SUMMARY_INPUT_TOKEN_LIMIT
+
+
+class DeferredSummarizationToolMiddleware(SummarizationToolMiddleware):
+    """Expose ``compact_conversation`` and bind the main ``SummarizationMiddleware`` after build."""
+
+    def __init__(self, *, system_prompt: str | None = None) -> None:
+        self._bound_summarization: Any | None = None
+        self._summarization = None  # type: ignore[assignment]
+        self.system_prompt = system_prompt
+        self.tools = [self._create_compact_tool()]
+
+    def bind(self, summarization: Any) -> None:
+        """Attach the compiled main-agent ``SummarizationMiddleware`` instance."""
+        self._bound_summarization = summarization
+        self._summarization = summarization
+
+    def _run_compact(self, runtime: ToolRuntime[Any, Any]) -> Command[Any]:
+        if self._bound_summarization is None:
+            return Command(
+                update={
+                    "messages": [
+                        ToolMessage(
+                            content="Conversation compaction is unavailable in this runtime.",
+                            tool_call_id=runtime.tool_call_id or "",
+                            status="error",
+                        )
+                    ]
+                }
+            )
+        return super()._run_compact(runtime)
+
+    async def _arun_compact(self, runtime: ToolRuntime[Any, Any]) -> Command[Any]:
+        if self._bound_summarization is None:
+            return Command(
+                update={
+                    "messages": [
+                        ToolMessage(
+                            content="Conversation compaction is unavailable in this runtime.",
+                            tool_call_id=runtime.tool_call_id or "",
+                            status="error",
+                        )
+                    ]
+                }
+            )
+        return await super()._arun_compact(runtime)
 
 
 def summary_fallback_keep() -> int:
@@ -147,21 +247,44 @@ def _is_tool_message(message: Any) -> bool:
     return type(message).__name__ == "ToolMessage"
 
 
+def _retry_windows(helper: Any) -> list[int]:
+    """Return progressively smaller input budgets to try after a context overflow."""
+    current = getattr(helper, "trim_tokens_to_summarize", None)
+    if not isinstance(current, int):
+        return [SUMMARY_INPUT_RETRY_TOKEN_LIMIT]
+    windows: list[int] = []
+    if current > SUMMARY_INPUT_TOKEN_LIMIT:
+        windows.append(SUMMARY_INPUT_TOKEN_LIMIT)
+    if current > SUMMARY_INPUT_RETRY_TOKEN_LIMIT:
+        windows.append(SUMMARY_INPUT_RETRY_TOKEN_LIMIT)
+    return windows
+
+
 def _summary_or_fallback(helper: Any, call: Callable[[Any], str], messages: Any) -> str:
     try:
         return call(messages)
     except Exception as exc:
         if not _is_context_overflow(exc):
             raise
-        logger.warning("conversation summary failed (%s); retrying with a smaller window", type(exc).__name__)
-        if not _use_smaller_window(helper):
+        windows = _retry_windows(helper)
+        if not windows:
+            logger.warning("conversation summary failed (%s); using a placeholder", type(exc).__name__)
             return SUMMARY_FALLBACK_TEXT
         previous = helper.trim_tokens_to_summarize
-        helper.trim_tokens_to_summarize = SUMMARY_INPUT_RETRY_TOKEN_LIMIT
         try:
-            return call(messages)
-        except Exception as retry_exc:
-            return _placeholder_after_overflow(retry_exc)
+            for limit in windows:
+                logger.warning(
+                    "conversation summary failed (%s); retrying with %d-token window",
+                    type(exc).__name__,
+                    limit,
+                )
+                helper.trim_tokens_to_summarize = limit
+                try:
+                    return call(messages)
+                except Exception as retry_exc:
+                    if not _is_context_overflow(retry_exc):
+                        raise
+            return _placeholder_after_overflow(exc)
         finally:
             helper.trim_tokens_to_summarize = previous
 
@@ -176,15 +299,25 @@ async def _asummary_or_fallback(
     except Exception as exc:
         if not _is_context_overflow(exc):
             raise
-        logger.warning("conversation summary failed (%s); retrying with a smaller window", type(exc).__name__)
-        if not _use_smaller_window(helper):
+        windows = _retry_windows(helper)
+        if not windows:
+            logger.warning("conversation summary failed (%s); using a placeholder", type(exc).__name__)
             return SUMMARY_FALLBACK_TEXT
         previous = helper.trim_tokens_to_summarize
-        helper.trim_tokens_to_summarize = SUMMARY_INPUT_RETRY_TOKEN_LIMIT
         try:
-            return await call(messages)
-        except Exception as retry_exc:
-            return _placeholder_after_overflow(retry_exc)
+            for limit in windows:
+                logger.warning(
+                    "conversation summary failed (%s); retrying with %d-token window",
+                    type(exc).__name__,
+                    limit,
+                )
+                helper.trim_tokens_to_summarize = limit
+                try:
+                    return await call(messages)
+                except Exception as retry_exc:
+                    if not _is_context_overflow(retry_exc):
+                        raise
+            return _placeholder_after_overflow(exc)
         finally:
             helper.trim_tokens_to_summarize = previous
 
@@ -200,11 +333,6 @@ def _placeholder_after_overflow(exc: Exception) -> str:
     return SUMMARY_FALLBACK_TEXT
 
 
-def _use_smaller_window(helper: Any) -> bool:
-    current = getattr(helper, "trim_tokens_to_summarize", None)
-    return not isinstance(current, int) or current > SUMMARY_INPUT_RETRY_TOKEN_LIMIT
-
-
 def build_configured_summarization_middleware(
     factory: Callable[..., Any],
     args: tuple[Any, ...],
@@ -215,11 +343,14 @@ def build_configured_summarization_middleware(
     from octop_harness.middleware.memory_recall import count_tokens_with_recall
 
     kwargs.setdefault("token_counter", count_tokens_with_recall)
-    trim = getattr(config, "summarization_trim_tokens", None)
-    if isinstance(trim, int) and not isinstance(trim, bool):
+    kwargs.setdefault("summary_prompt", STRUCTURED_SUMMARY_PROMPT)
+    model = args[0] if args else kwargs.get("model")
+    configured_trim = getattr(config, "summarization_trim_tokens", None)
+    trim = resolve_summary_input_token_limit(model, configured_trim)
+    if isinstance(configured_trim, int) and not isinstance(configured_trim, bool):
         kwargs["trim_tokens_to_summarize"] = trim
     else:
-        kwargs.setdefault("trim_tokens_to_summarize", SUMMARY_INPUT_TOKEN_LIMIT)
+        kwargs.setdefault("trim_tokens_to_summarize", trim)
     middleware = harden_summarization_middleware(factory(*args, **kwargs))
     apply_summarization_policy(middleware, config)
     return middleware

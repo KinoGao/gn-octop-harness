@@ -156,6 +156,22 @@ def resolve_subagent_tools(
     return resolved
 
 
+def _resolve_subagent_skills(
+    raw: Any,
+    *,
+    mode: str,
+    workspace: BackendWorkspace | None,
+    path_fragment: str,
+) -> list[str] | None:
+    if raw is None or workspace is None:
+        return None
+    if mode == "fork":
+        logger.warning("Ignoring skills on forked subagent %s (fork inherits parent skills)", path_fragment)
+        return None
+    entries = [raw] if isinstance(raw, str) else list(raw) if isinstance(raw, list) else []
+    return [workspace.resolve_path(str(s)) for s in entries if str(s).strip()]
+
+
 def parse_agent_markdown(
     text: str,
     *,
@@ -181,15 +197,23 @@ def parse_agent_markdown(
         "description": str(description).strip(),
         "system_prompt": body.strip() or str(description).strip(),
     }
+    mode = str(meta.get("mode") or "").strip().lower()
+    if mode == "fork":
+        spec["mode"] = "fork"
     model = meta.get("model")
     if model is not None and str(model).strip():
         spec["model"] = str(model).strip()
-    skills_raw = meta.get("skills")
-    if skills_raw is not None and workspace is not None:
-        if isinstance(skills_raw, str):
-            skills_raw = [skills_raw]
-        if isinstance(skills_raw, list):
-            spec["skills"] = [workspace.resolve_path(str(s)) for s in skills_raw if str(s).strip()]
+    response_format = meta.get("response_format")
+    if isinstance(response_format, dict) and response_format:
+        spec["response_format"] = dict(response_format)
+    resolved_skills = _resolve_subagent_skills(
+        meta.get("skills"),
+        mode=mode,
+        workspace=workspace,
+        path_fragment=path_fragment,
+    )
+    if resolved_skills is not None:
+        spec["skills"] = resolved_skills
     if parent_tools is not None:
         tools_meta = _parse_tools_meta(meta.get("tools"))
         resolved_tools = resolve_subagent_tools(tools_meta, parent_tools=parent_tools)

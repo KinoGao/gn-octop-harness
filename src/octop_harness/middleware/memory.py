@@ -43,6 +43,8 @@ from octop_harness.middleware.checkpoint_backup import (
     prepare_checkpoint_backup,
 )
 from octop_harness.middleware.memory_recall import (
+    build_recall_query,
+    deduplicate_recalled_text,
     has_recall_snapshot,
     replay_recall_snapshots,
     stamp_recall_snapshot,
@@ -487,7 +489,12 @@ class MemoryMiddleware(AgentMiddleware[Any, Any]):
                     for path, body in state.get("memory_contents", {}).items()
                     if str(path).replace("\\", "/").rsplit("/", 1)[-1] in {"USER.md", "MEMORY.md"}
                 }
-                stamped = self._prepare_recall(messages[-1], runtime, manual_context=manual_context or None)
+                stamped = self._prepare_recall(
+                    messages[-1],
+                    runtime,
+                    messages=messages,
+                    manual_context=manual_context or None,
+                )
                 return {"messages": [stamped]}
         except Exception:  # pragma: no cover - never raise into the user turn; pylint: disable=broad-except
             logger.warning("MemoryMiddleware before_model failed", exc_info=True)
@@ -666,12 +673,17 @@ class MemoryMiddleware(AgentMiddleware[Any, Any]):
     # ------------------------------------------------------------------
 
     def _prepare_recall(
-        self, message: HumanMessage, runtime: Any, *, manual_context: dict[str, str] | None = None
+        self,
+        message: HumanMessage,
+        runtime: Any,
+        *,
+        messages: list[BaseMessage] | None = None,
+        manual_context: dict[str, str] | None = None,
     ) -> HumanMessage:
         """Freeze success, empty recall, maintenance skip, or failure for this turn."""
         rendered = ""
         try:
-            query = _stringify_content(message.content).strip()
+            query = build_recall_query(messages) if messages else _stringify_content(message.content).strip()
             configurable = _get_configurable(runtime)
             thread_id = _opt_id(configurable, "thread_id")
             session_id = _opt_id(configurable, "session_id") or thread_id
@@ -683,7 +695,9 @@ class MemoryMiddleware(AgentMiddleware[Any, Any]):
                 result = self._service.recall(
                     query, thread_id=thread_id, session_id=session_id, limit=self._recall_limit, **context_options
                 )
-                rendered = getattr(result, "rendered", None) or ""
+                raw_rendered = getattr(result, "rendered", None) or ""
+                prior = messages[:-1] if messages and len(messages) > 1 else []
+                rendered = deduplicate_recalled_text(raw_rendered, prior) if raw_rendered else ""
                 logger.debug(
                     "memory.trigger recall_inject thread=%s session=%s query_chars=%d query_sha256=%s limit=%d hit=%s",
                     thread_id,

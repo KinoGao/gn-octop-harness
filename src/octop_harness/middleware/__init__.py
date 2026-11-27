@@ -5,6 +5,7 @@ from __future__ import annotations
 from octop_harness.middleware.client_tool_search import ClientToolSearchMiddleware
 from octop_harness.middleware.conversation_mode import ConversationModeMiddleware
 from octop_harness.middleware.filesystem_guard import FilesystemGuardMiddleware
+from octop_harness.middleware.grounding import GroundingMiddleware
 from octop_harness.middleware.mcp_tool_error import McpToolErrorMiddleware
 from octop_harness.middleware.media_offload import MediaOffloadMiddleware
 from octop_harness.middleware.memory import MemoryMiddleware
@@ -16,7 +17,9 @@ from octop_harness.middleware.model_settings import (
 from octop_harness.middleware.native_tool_search import NativeToolSearchMiddleware
 from octop_harness.middleware.peer import PeerAgentMiddleware
 from octop_harness.middleware.pii import detect_pii
+from octop_harness.middleware.summarization_limits import DeferredSummarizationToolMiddleware
 from octop_harness.middleware.task_reliability import TaskReliabilityMiddleware
+from octop_harness.middleware.tool_result_budget import ToolResultBudgetMiddleware
 from octop_harness.middleware.tool_search import ToolSearchMiddleware
 
 __all__ = [
@@ -24,7 +27,9 @@ __all__ = [
     "CONFIGURABLE_MODEL_SETTINGS",
     "ClientToolSearchMiddleware",
     "ConversationModeMiddleware",
+    "DeferredSummarizationToolMiddleware",
     "FilesystemGuardMiddleware",
+    "GroundingMiddleware",
     "McpToolErrorMiddleware",
     "MediaOffloadMiddleware",
     "MemoryMiddleware",
@@ -32,6 +37,7 @@ __all__ = [
     "NativeToolSearchMiddleware",
     "PeerAgentMiddleware",
     "TaskReliabilityMiddleware",
+    "ToolResultBudgetMiddleware",
     "ToolSearchMiddleware",
     "detect_pii",
 ]

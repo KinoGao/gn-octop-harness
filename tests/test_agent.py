@@ -1822,3 +1822,45 @@ def test_summarization_factory_patch_is_exclusive() -> None:
     second.join(timeout=2)
     assert second_in.is_set()
     assert graph.create_summarization_middleware is original
+
+
+def test_phase1_intelligence_defaults_wiring_and_config_roundtrip(
+    tmp_path: Path,
+    mock_model_factory: Callable[[], Any],
+    stub_create_deep_agent: Any,
+) -> None:
+    from octop_harness.prompts import render_execution_discipline_prompt
+
+    cfg = HarnessAgentConfig(
+        name="p1-test",
+        workspace_dir=tmp_path,
+        providers=[
+            ProviderConfig(
+                id="p",
+                base_url="https://x",
+                api_key="k",
+                models=[ModelConfig(id="text", input=["text"])],
+            ),
+        ],
+        default_model="p/text",
+        memory_enabled=False,
+        checkpointer=False,
+        language="zh",
+    )
+    loaded = HarnessAgentConfig.from_dict(cfg.to_dict())
+    assert loaded.grounding_enabled is True
+    assert loaded.tool_result_max_tokens == 25_000
+    assert loaded.tool_result_spill_dir == ".tool-outputs"
+    assert loaded.defer_mcp_tools_threshold == 15
+    assert loaded.summarization_tool_enabled is True
+
+    with mock_model_factory(), stub_create_deep_agent as create:
+        HarnessAgent(cfg)
+        prompt = create.call_args.kwargs["system_prompt"]
+        mw_names = [type(m).__name__ for m in create.call_args.kwargs["middleware"]]
+
+    assert render_execution_discipline_prompt(language="zh") in prompt
+    assert mw_names.index("DeferredSummarizationToolMiddleware") < mw_names.index("ConversationModeMiddleware")
+    assert mw_names.index("TaskReliabilityMiddleware") < mw_names.index("GroundingMiddleware")
+    assert mw_names.index("GroundingMiddleware") < mw_names.index("ToolResultBudgetMiddleware")
+    assert mw_names.index("ToolResultBudgetMiddleware") < mw_names.index("McpToolErrorMiddleware")

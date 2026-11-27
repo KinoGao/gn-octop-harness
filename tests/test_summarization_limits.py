@@ -301,3 +301,62 @@ def test_summarization_config_round_trip_and_rejects_keep_above_trigger(tmp_path
             summarization_trigger=("fraction", 0.4),
             summarization_keep=("fraction", 0.4),
         )
+
+
+def test_adaptive_summary_input_limit_scales_with_model_window() -> None:
+    from octop_harness.middleware.summarization_limits import (
+        STRUCTURED_SUMMARY_PROMPT,
+        SUMMARY_ADAPTIVE_MAX_TOKENS,
+        resolve_summary_input_token_limit,
+    )
+
+    assert resolve_summary_input_token_limit(SimpleNamespace(profile=None)) == SUMMARY_INPUT_TOKEN_LIMIT
+    assert resolve_summary_input_token_limit(SimpleNamespace(profile={"max_input_tokens": 16_000})) == 8000
+    assert resolve_summary_input_token_limit(SimpleNamespace(profile={"max_input_tokens": 64_000})) == 16_000
+    assert (
+        resolve_summary_input_token_limit(SimpleNamespace(profile={"max_input_tokens": 200_000}))
+        == SUMMARY_ADAPTIVE_MAX_TOKENS
+    )
+    assert resolve_summary_input_token_limit(SimpleNamespace(profile={"max_input_tokens": 200_000}), 6000) == 6000
+    assert "## Goal & Scope" in STRUCTURED_SUMMARY_PROMPT
+    assert "## Failed Attempts & Blockers" in STRUCTURED_SUMMARY_PROMPT
+    assert "{messages}" in STRUCTURED_SUMMARY_PROMPT
+
+
+def test_large_adaptive_window_steps_down_through_8k_and_4k_before_placeholder() -> None:
+    seen: list[int | None] = []
+    mw = _middleware(trim=32_000, sync_error=ContextOverflowError("prompt is too long"), seen=seen)
+    harden_summarization_middleware(mw)
+    assert mw._create_summary(["history"]) == SUMMARY_FALLBACK_TEXT
+    assert seen == [32_000, SUMMARY_INPUT_TOKEN_LIMIT, SUMMARY_INPUT_RETRY_TOKEN_LIMIT]
+    assert mw._lc_helper.trim_tokens_to_summarize == 32_000
+
+
+def test_deferred_summarization_tool_middleware_handles_unbound_and_bound() -> None:
+    from langchain.tools import ToolRuntime
+    from langchain_core.messages import ToolMessage
+    from langgraph.types import Command
+
+    from octop_harness.middleware.summarization_limits import DeferredSummarizationToolMiddleware
+
+    mw = DeferredSummarizationToolMiddleware()
+    assert [tool.name for tool in mw.tools] == ["compact_conversation"]
+    runtime = ToolRuntime(
+        state={},
+        context=None,
+        config={"configurable": {"thread_id": "t-1"}},
+        stream_writer=lambda _: None,
+        tool_call_id="c-1",
+        store=None,
+        tools=[],
+    )
+    unbound = mw._run_compact(runtime)
+    assert isinstance(unbound, Command)
+    assert isinstance(unbound.update, dict)
+    msg = unbound.update["messages"][0]
+    assert isinstance(msg, ToolMessage)
+    assert msg.status == "error"
+
+    real_summ = _real_summarization_middleware()
+    mw.bind(real_summ)
+    assert mw._summarization is real_summ

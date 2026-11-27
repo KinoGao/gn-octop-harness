@@ -20,6 +20,7 @@ from langgraph.config import get_config
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
+from octop_harness.mcp import is_readonly_tool
 from octop_harness.middleware.runtime import runtime_config
 from octop_harness.middleware.turn_note import insert_turn_note
 
@@ -209,7 +210,7 @@ def apply_conversation_mode_to_request(request: ModelRequest[Any]) -> ModelReque
     if mode != "craft":
         allowed = allowed_tool_names(mode, extra_read=extra_read_tools(configurable))
         tools_in = list(request.tools or [])
-        filtered = [t for t in tools_in if _tool_base_name(_tool_name(t)) in allowed]
+        filtered = [t for t in tools_in if _tool_base_name(_tool_name(t)) in allowed or is_readonly_tool(t)]
         if len(filtered) != len(tools_in):
             out = out.override(tools=filtered)
         out = _clear_skills_metadata(out)
@@ -243,12 +244,13 @@ def _tool_block_reason(
     args: dict[str, Any],
     mode: ConversationMode,
     extra_read: Iterable[str],
+    readonly_tool: bool = False,
 ) -> ToolMessage | None:
     if mode == "craft":
         return None
     allowed = allowed_tool_names(mode, extra_read=extra_read)
     base = _tool_base_name(tool_name)
-    if base not in allowed:
+    if base not in allowed and not readonly_tool:
         return _blocked_message(tool_name=tool_name or base, mode=mode, tool_call_id="")
     if any(_mentions_skill_dir(chunk) for chunk in _iter_arg_strings(args)):
         return _blocked_message(tool_name=tool_name or base, mode=mode, tool_call_id="")
@@ -307,6 +309,7 @@ class ConversationModeMiddleware(AgentMiddleware[Any, Any]):
             args=args,
             mode=mode,
             extra_read=extra_read_tools(configurable),
+            readonly_tool=is_readonly_tool(request.tool),
         )
         if blocked is None:
             return None

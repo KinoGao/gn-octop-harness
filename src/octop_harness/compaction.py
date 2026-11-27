@@ -118,8 +118,9 @@ def _build_force_summarization_middleware(model: Any, backend: Any) -> Any:
 
     from octop_harness.middleware.memory_recall import count_tokens_with_recall
     from octop_harness.middleware.summarization_limits import (
-        SUMMARY_INPUT_TOKEN_LIMIT,
+        STRUCTURED_SUMMARY_PROMPT,
         harden_summarization_middleware,
+        resolve_summary_input_token_limit,
     )
 
     defaults = compute_summarization_defaults(model)
@@ -131,7 +132,8 @@ def _build_force_summarization_middleware(model: Any, backend: Any) -> Any:
             trigger=defaults["trigger"],
             keep=("messages", FORCE_KEEP_MESSAGES),
             token_counter=count_tokens_with_recall,
-            trim_tokens_to_summarize=SUMMARY_INPUT_TOKEN_LIMIT,
+            summary_prompt=STRUCTURED_SUMMARY_PROMPT,
+            trim_tokens_to_summarize=resolve_summary_input_token_limit(model),
             truncate_args_settings=defaults.get("truncate_args_settings"),
         )
     )

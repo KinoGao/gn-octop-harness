@@ -373,3 +373,55 @@ def test_parallel_search_calls_merge_loaded_tools() -> None:
         message for message in result["messages"] if isinstance(message, ToolMessage) and message.name == "tool_search"
     ]
     assert len(search_results) == 2
+
+
+def test_search_matches_chinese_and_mixed_keywords() -> None:
+    calendar = StructuredTool.from_function(
+        lambda: "ok", name="dingtalk_calendar", description="查询钉钉日程和会议安排"
+    )
+    approval = StructuredTool.from_function(
+        lambda: "ok", name="dingtalk_approval", description="发起或查询钉钉审批流程"
+    )
+    middleware = ClientToolSearchMiddleware(
+        deferred_tools=frozenset(),
+        mcp_tool_names=frozenset({"dingtalk_calendar", "dingtalk_approval"}),
+        defer_mcp_tools=True,
+    )
+    _capture_tools(middleware, _request([calendar, approval]))
+
+    zh_result = middleware._search("钉钉日程", 3, _runtime())
+    assert isinstance(zh_result, Command)
+    zh_update = cast(dict[str, Any], zh_result.update)
+    assert zh_update["loaded_tool_names"][0] == "dingtalk_calendar"
+
+    mixed_result = middleware._search("dingtalk 审批", 3, _runtime())
+    assert isinstance(mixed_result, Command)
+    mixed_update = cast(dict[str, Any], mixed_result.update)
+    assert mixed_update["loaded_tool_names"][0] == "dingtalk_approval"
+
+
+def test_mcp_auto_defer_threshold_triggers_only_when_visible_mcp_exceeds_limit() -> None:
+    mcp_tools = [_prompt_tool(f"mcp_tool_{i}") for i in range(4)]
+    mcp_names = frozenset(tool.name for tool in mcp_tools)
+    middleware = ClientToolSearchMiddleware(
+        deferred_tools=frozenset(),
+        mcp_tool_names=mcp_names,
+        defer_mcp_tools=False,
+        defer_mcp_tools_threshold=2,
+    )
+
+    # Below/equal threshold -> eager passthrough, no tool_search injected.
+    few_tools = _capture_tools(middleware, _request(mcp_tools[:2]))
+    assert [getattr(t, "name", None) for t in few_tools] == ["mcp_tool_0", "mcp_tool_1"]
+    assert "prompt" in few_tools[0].args
+
+    # Above threshold -> auto-deferred with tool_search exposed.
+    many_tools = _capture_tools(middleware, _request(mcp_tools[:3]))
+    assert [getattr(t, "name", None) for t in many_tools] == [
+        "tool_search",
+        "mcp_tool_0",
+        "mcp_tool_1",
+        "mcp_tool_2",
+    ]
+    assert many_tools[1].args == {}
+    assert "Deferred reference" in many_tools[1].description

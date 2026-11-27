@@ -18,9 +18,19 @@ from octop_harness.protocols.base import ChatProtocol
 from octop_harness.protocols.think_splitter import ThinkSplitter
 from octop_harness.usage import normalize_usage_metadata
 
-_INTERNAL_LC_SOURCES = frozenset({"summarization"})
+_INTERNAL_LC_SOURCES = frozenset({"summarization", "rubric_grader"})
 _DURABILITY_ENV = "OCTOP_CHECKPOINT_DURABILITY"
 logger = logging.getLogger(__name__)
+
+
+def _graph_input(messages: list[Any], config: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {"messages": messages}
+    configurable = config.get("configurable")
+    if isinstance(configurable, dict):
+        rubric = configurable.get("rubric")
+        if isinstance(rubric, str) and rubric.strip():
+            payload["rubric"] = rubric.strip()
+    return payload
 
 
 @lru_cache(maxsize=16)
@@ -198,7 +208,7 @@ class LangGraphProtocol(ChatProtocol):
         async with checkpoint_activity(
             getattr(self._graph, "checkpointer", None), str((config.get("configurable") or {}).get("thread_id") or "")
         ):
-            result: dict[str, Any] = await self._graph.ainvoke({"messages": messages}, config=config, **options)
+            result: dict[str, Any] = await self._graph.ainvoke(_graph_input(messages, config), config=config, **options)
             return result
 
     async def stream(
@@ -211,7 +221,7 @@ class LangGraphProtocol(ChatProtocol):
         async with aclosing(
             _guarded_checkpoint_stream(
                 self._graph.astream(
-                    {"messages": messages},
+                    _graph_input(messages, config),
                     config=config,
                     stream_mode=["values", "updates", "messages", "custom"],
                     version="v2",
@@ -371,7 +381,7 @@ class LangGraphProtocol(ChatProtocol):
         **kwargs: Any,
     ) -> Any:
         stream = await self._graph.astream_events(
-            {"messages": messages}, config=config, version="v3", **self._durability_options(kwargs)
+            _graph_input(messages, config), config=config, version="v3", **self._durability_options(kwargs)
         )
         checkpointer = getattr(self._graph, "checkpointer", None)
         if callable(getattr(type(checkpointer), "checkpoint_activity", None)) or callable(

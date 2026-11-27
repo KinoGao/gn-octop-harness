@@ -1,5 +1,7 @@
 """Unified client-side and provider-native progressive tool loading."""
 
+from __future__ import annotations
+
 import json
 import re
 from collections import OrderedDict
@@ -25,6 +27,7 @@ from pydantic import BaseModel, Field
 _TOOL_SEARCH_NAME = "tool_search"
 _MAX_THREAD_CATALOGS = 2048
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
 _DEFERRED_DESCRIPTION_SUFFIX = "\n\n[Deferred reference: call tool_search before use.]"
 _SUPPORTED_NATIVE_PROVIDERS = frozenset({"openai", "anthropic"})
 
@@ -49,7 +52,7 @@ class ClientToolSearchState(AgentState[Any]):
 class ToolSearchInput(BaseModel):
     """Arguments accepted by the provider-agnostic search tool."""
 
-    query: str = Field(description="Short capability keywords, preferably in English.")
+    query: str = Field(description="Short capability keywords in Chinese or English.")
     max_results: int = Field(default=3, ge=1, le=5)
 
 
@@ -104,9 +107,21 @@ def _make_eager(tool: Any) -> Any:
     return tool.model_copy(update={"extras": extras})
 
 
+def _cjk_segments(text: str) -> list[str]:
+    return _CJK_RE.findall(text)
+
+
 def _tokens(text: str) -> set[str]:
-    tokens = set(_TOKEN_RE.findall(text.lower().replace("_", " ")))
-    return {token[:-1] if len(token) > 3 and token.endswith("s") else token for token in tokens}
+    ascii_tokens = set(_TOKEN_RE.findall(text.lower().replace("_", " ")))
+    normalized = {token[:-1] if len(token) > 3 and token.endswith("s") else token for token in ascii_tokens}
+    for segment in _cjk_segments(text):
+        if len(segment) == 1:
+            normalized.add(segment)
+        else:
+            normalized.add(segment)
+            for idx in range(len(segment) - 1):
+                normalized.add(segment[idx : idx + 2])
+    return normalized
 
 
 def _search_score(query: str, descriptor: _ToolDescriptor) -> int:
@@ -120,6 +135,11 @@ def _search_score(query: str, descriptor: _ToolDescriptor) -> int:
     score += 5 * len(query_tokens & description_tokens)
     if normalized_query and normalized_query in descriptor.name.lower():
         score += 100
+    for segment in _cjk_segments(query):
+        if segment in descriptor.name:
+            score += 100
+        elif segment in descriptor.description:
+            score += 30
     return score
 
 
@@ -141,6 +161,7 @@ class ToolSearchMiddleware(AgentMiddleware[ClientToolSearchState, Any]):
         deferred_tools: frozenset[str],
         mcp_tool_names: frozenset[str] | None = None,
         defer_mcp_tools: bool = False,
+        defer_mcp_tools_threshold: int = 0,
         mode: Literal["client", "native"] = "client",
         fallback: Literal["eager", "error"] = "eager",
     ) -> None:
@@ -148,6 +169,7 @@ class ToolSearchMiddleware(AgentMiddleware[ClientToolSearchState, Any]):
         self._deferred_tools = deferred_tools
         self._mcp_tool_names = mcp_tool_names or frozenset()
         self._defer_mcp_tools = defer_mcp_tools
+        self._defer_mcp_tools_threshold = max(0, int(defer_mcp_tools_threshold))
         self._mode = mode
         self._fallback = fallback
         self._catalogs: OrderedDict[str, dict[str, _ToolDescriptor]] = OrderedDict()
@@ -158,7 +180,7 @@ class ToolSearchMiddleware(AgentMiddleware[ClientToolSearchState, Any]):
                 description=(
                     "Load the full input schemas for deferred tool references. Deferred tools "
                     "are already listed by name and description, but must be searched before "
-                    "use. Search with short capability keywords (preferably English), then call "
+                    "use. Search with short capability keywords (Chinese or English), then call "
                     "a returned tool by its real name."
                 ),
                 func=self._tool_search,
@@ -213,8 +235,17 @@ class ToolSearchMiddleware(AgentMiddleware[ClientToolSearchState, Any]):
         blocked = self._unloaded_error(request)
         return blocked if blocked is not None else await handler(request)
 
+    def _should_defer_mcp_for_tools(self, tools: list[Any]) -> bool:
+        if self._defer_mcp_tools:
+            return True
+        if self._defer_mcp_tools_threshold <= 0 or not self._mcp_tool_names:
+            return False
+        visible_mcp = sum(1 for tool in tools if isinstance(tool, BaseTool) and tool.name in self._mcp_tool_names)
+        return visible_mcp > self._defer_mcp_tools_threshold
+
     def _prepare_client(self, request: ModelRequest) -> ModelRequest:
         tools = list(request.tools or [])
+        defer_mcp = self._should_defer_mcp_for_tools(tools)
         selected: dict[str, BaseTool] = {}
         eager: list[Any] = []
         provider_tools: list[Any] = []
@@ -226,7 +257,7 @@ class ToolSearchMiddleware(AgentMiddleware[ClientToolSearchState, Any]):
             if tool.name == _TOOL_SEARCH_NAME:
                 continue
             should_defer = tool.name in self._deferred_tools or _is_self_deferred(tool)
-            if self._defer_mcp_tools and tool.name in self._mcp_tool_names:
+            if defer_mcp and tool.name in self._mcp_tool_names:
                 should_defer = True
             if should_defer:
                 selected[tool.name] = tool
@@ -250,9 +281,10 @@ class ToolSearchMiddleware(AgentMiddleware[ClientToolSearchState, Any]):
         request: ModelRequest,
     ) -> tuple[ModelRequest, ProviderToolSearchMiddleware | None]:
         tools = list(request.tools or [])
+        defer_mcp = self._should_defer_mcp_for_tools(tools)
         visible_names = {tool.name for tool in tools if isinstance(tool, BaseTool)}
         selected = self._deferred_tools & visible_names
-        if self._defer_mcp_tools:
+        if defer_mcp:
             selected |= self._mcp_tool_names & visible_names
 
         has_deferred = bool(selected) or any(isinstance(tool, BaseTool) and _is_self_deferred(tool) for tool in tools)
@@ -341,7 +373,7 @@ class ToolSearchMiddleware(AgentMiddleware[ClientToolSearchState, Any]):
             lines.extend(f"- {item.name}: {item.description}" for item in matches)
             lines.append("These tool schemas are available on the next model step.")
         else:
-            lines = ["No deferred tools matched. Try broader English capability keywords."]
+            lines = ["No deferred tools matched. Try broader Chinese or English capability keywords."]
         return Command(
             update={
                 "loaded_tool_names": [item.name for item in matches],

@@ -378,3 +378,113 @@ async def test_async_graph_records_parallel_results() -> None:
     state = await agent.ainvoke({"messages": [HumanMessage(content="read")]}, {"configurable": {"thread_id": "one"}})
     assert set(state["tool_observations"]) == {"a", "b"}
     assert state["messages"][-2].status == "success"
+
+
+def test_consecutive_distinct_failures_inject_failure_reflection_note() -> None:
+    from unittest.mock import Mock
+
+    from langchain.agents.middleware import ModelRequest, ModelResponse
+
+    middleware = TaskReliabilityMiddleware()
+    captured: list[ModelRequest] = []
+
+    def handler(req: ModelRequest) -> ModelResponse:
+        captured.append(req)
+        return ModelResponse(result=[])
+
+    state: dict[str, Any] = {
+        "messages": [HumanMessage(content="fix the test", id="turn-1")],
+        "tool_observations": {
+            "c1": {
+                "tool": "edit_file",
+                "fingerprint": "f1",
+                "scope": "",
+                "turn": "turn-1",
+                "outcome": "error",
+                "verification": False,
+                "step": 1,
+            },
+            "c2": {
+                "tool": "edit_file",
+                "fingerprint": "f2",
+                "scope": "",
+                "turn": "turn-1",
+                "outcome": "error",
+                "verification": False,
+                "step": 2,
+            },
+            "c3": {
+                "tool": "edit_file",
+                "fingerprint": "f3",
+                "scope": "",
+                "turn": "turn-1",
+                "outcome": "error",
+                "verification": False,
+                "step": 3,
+            },
+        },
+    }
+    request = ModelRequest(model=Mock(), messages=state["messages"], tools=[], state=state, runtime=Mock())
+    middleware.wrap_model_call(request, handler)
+
+    note = captured[0].messages[-1].text
+    assert "Failure reflection required" in note
+    assert "3 consecutive tool failures" in note
+    assert "edit_file (3x)" in note
+
+
+def test_unfinished_todos_appear_in_turn_note_and_block_completed_checkpoint() -> None:
+    from unittest.mock import Mock
+
+    from langchain.agents.middleware import ModelRequest, ModelResponse
+    from langchain.tools import ToolRuntime
+
+    middleware = TaskReliabilityMiddleware()
+    captured: list[ModelRequest] = []
+
+    def handler(req: ModelRequest) -> ModelResponse:
+        captured.append(req)
+        return ModelResponse(result=[])
+
+    state: dict[str, Any] = {
+        "messages": [HumanMessage(content="ship feature", id="turn-1")],
+        "todos": [
+            {"content": "Write unit tests", "status": "in_progress"},
+            {"content": "Run typecheck", "status": "pending"},
+            {"content": "Read code", "status": "completed"},
+        ],
+        "tool_observations": {
+            "r1": {
+                "tool": "read_file",
+                "fingerprint": "f1",
+                "scope": "",
+                "turn": "turn-1",
+                "outcome": "success",
+                "verification": True,
+                "step": 1,
+            },
+        },
+    }
+    request = ModelRequest(model=Mock(), messages=state["messages"], tools=[], state=state, runtime=Mock())
+    middleware.wrap_model_call(request, handler)
+    note = captured[0].messages[-1].text
+    assert "Unfinished todos (2)" in note
+    assert "Write unit tests" in note
+    assert "Read code" not in note
+
+    runtime = ToolRuntime(
+        state=state,  # type: ignore[arg-type]
+        context=None,
+        config={"configurable": {"thread_id": "t-todo"}},
+        stream_writer=lambda _: None,
+        tool_call_id="cp-1",
+        store=None,
+        tools=[],
+    )
+    res = middleware._checkpoint(runtime, goal="ship feature", status="completed", evidence=["r1"])
+    assert isinstance(res, Command)
+    assert isinstance(res.update, dict)
+    msg = res.update["messages"][0]
+    assert isinstance(msg, ToolMessage)
+    assert msg.status == "error"
+    assert "unfinished_todos" in msg.text

@@ -602,6 +602,9 @@ class HarnessAgentConfig:
     tools_disabled: frozenset[str] = field(default_factory=frozenset)
     subagents_path: str | Path | Sequence[str | Path] | None = None
     subagents_auto_load: bool = True
+    # Allow subagents to access read-only MCP tools from the parent turn's active
+    # MCP server selection (write/unannotated MCP tools stay stripped).
+    subagent_inherit_readonly_mcp: bool = True
     # Keep the parent-only ``task`` tool after tools inherited by subagents so
     # provider-side prefix caches can reuse the complete shared tool block.
     task_tool_last: bool = True
@@ -723,6 +726,9 @@ class HarnessAgentConfig:
     deferred_tools: frozenset[str] = field(default_factory=frozenset)
     # Defer every MCP tool that remains visible after per-request MCP filtering.
     defer_mcp_tools: bool = False
+    # Auto-defer visible MCP tools when their count exceeds this threshold
+    # (0 disables auto-defer and respects only ``defer_mcp_tools``).
+    defer_mcp_tools_threshold: int = 15
     # ``client`` uses an ordinary function tool and works with any model that
     # supports tool calling. ``native`` delegates discovery to supported
     # OpenAI/Anthropic APIs. ``eager`` disables deferred loading.
@@ -730,6 +736,23 @@ class HarnessAgentConfig:
     # Unsupported routed models either receive eager schemas (production-safe
     # default) or fail explicitly when ``tool_search_mode="native"``.
     tool_search_fallback: Literal["eager", "error"] = "eager"
+
+    # —— Independent rubric verification ——
+    # Mounts deepagents' RubricMiddleware (zero-cost when a turn passes no rubric).
+    # When ChatRequest.rubric is supplied, an independent grader evaluates the
+    # final response and loops up to ``rubric_max_iterations`` times on gaps.
+    rubric_enabled: bool = True
+    rubric_max_iterations: int = 2
+    rubric_model: str | None = None
+
+    # —— Grounding & tool result budget ——
+    # Annotate stale reads after file writes and empty/error tool results so the
+    # model does not cite superseded snapshots or fabricate missing evidence.
+    grounding_enabled: bool = True
+    # Cap oversized plain-text tool outputs to this token budget (head + tail),
+    # spilling the full text to ``tool_result_spill_dir``. ``<= 0`` disables.
+    tool_result_max_tokens: int = 25_000
+    tool_result_spill_dir: str = ".tool-outputs"
 
     # —— Media offload (default ON: keep large inline base64 images / audio
     # out of long-running threads). After the first turn that contains a
@@ -748,6 +771,7 @@ class HarnessAgentConfig:
     # so ``/compact`` and a real context-window overflow can still summarize,
     # and an earlier summary stays applied on later turns.
     summarization_enabled: bool = True
+    summarization_tool_enabled: bool = True
     summarization_trigger: tuple[str, int | float] | None = None
     summarization_keep: tuple[str, int | float] | None = None
     summarization_trim_tokens: int | None = None
@@ -945,6 +969,7 @@ class HarnessAgentConfig:
         _validate_aux_timeout("memory_aux_light_timeout_s", self.memory_aux_light_timeout_s)
         _validate_aux_timeout("memory_aux_heavy_timeout_s", self.memory_aux_heavy_timeout_s)
         _validate_summarization_settings(self)
+        _validate_intelligence_settings(self)
 
         # Workspace must be an absolute directory: it doubles as the backend's
         # on-disk root for local backends and as the parent for all
@@ -1087,6 +1112,7 @@ class HarnessAgentConfig:
             "tools_disabled": sorted(self.tools_disabled),
             "subagents_path": _path_dirs_to_jsonable(self.subagents_path),
             "subagents_auto_load": self.subagents_auto_load,
+            "subagent_inherit_readonly_mcp": self.subagent_inherit_readonly_mcp,
             "task_tool_last": self.task_tool_last,
             "providers": [p.to_dict() for p in self.providers],
             "default_model": self.default_model,
@@ -1117,12 +1143,20 @@ class HarnessAgentConfig:
             "peer_invoke_mode": self.peer_invoke_mode,
             "deferred_tools": sorted(self.deferred_tools),
             "defer_mcp_tools": self.defer_mcp_tools,
+            "defer_mcp_tools_threshold": self.defer_mcp_tools_threshold,
             "tool_search_mode": self.tool_search_mode,
             "tool_search_fallback": self.tool_search_fallback,
+            "rubric_enabled": self.rubric_enabled,
+            "rubric_max_iterations": self.rubric_max_iterations,
+            "rubric_model": self.rubric_model,
+            "grounding_enabled": self.grounding_enabled,
+            "tool_result_max_tokens": self.tool_result_max_tokens,
+            "tool_result_spill_dir": self.tool_result_spill_dir,
             "media_offload_enabled": self.media_offload_enabled,
             "media_offload_min_bytes": self.media_offload_min_bytes,
             "media_offload_dir": self.media_offload_dir,
             "summarization_enabled": self.summarization_enabled,
+            "summarization_tool_enabled": self.summarization_tool_enabled,
             "summarization_trigger": (
                 list(self.summarization_trigger) if self.summarization_trigger is not None else None
             ),
@@ -1333,6 +1367,31 @@ def _validate_summarization_settings(config: HarnessAgentConfig) -> None:
     _validate_summarization_trim(config.summarization_trim_tokens)
     if not isinstance(config.summarization_enabled, bool):
         raise ValueError("summarization_enabled must be a bool")
+
+
+def _validate_intelligence_settings(config: HarnessAgentConfig) -> None:
+    if (
+        isinstance(config.defer_mcp_tools_threshold, bool)
+        or not isinstance(config.defer_mcp_tools_threshold, int)
+        or config.defer_mcp_tools_threshold < 0
+    ):
+        raise ValueError("defer_mcp_tools_threshold must be a non-negative int")
+    if isinstance(config.tool_result_max_tokens, bool) or not isinstance(config.tool_result_max_tokens, int):
+        raise ValueError("tool_result_max_tokens must be an int")
+    if not isinstance(config.grounding_enabled, bool):
+        raise ValueError("grounding_enabled must be a bool")
+    if not isinstance(config.summarization_tool_enabled, bool):
+        raise ValueError("summarization_tool_enabled must be a bool")
+    if not isinstance(config.subagent_inherit_readonly_mcp, bool):
+        raise ValueError("subagent_inherit_readonly_mcp must be a bool")
+    if not isinstance(config.rubric_enabled, bool):
+        raise ValueError("rubric_enabled must be a bool")
+    if (
+        isinstance(config.rubric_max_iterations, bool)
+        or not isinstance(config.rubric_max_iterations, int)
+        or config.rubric_max_iterations < 1
+    ):
+        raise ValueError("rubric_max_iterations must be a positive int")
 
 
 def _validate_summarization_size(name: str, value: Any) -> tuple[str, int | float] | None:

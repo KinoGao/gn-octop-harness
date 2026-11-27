@@ -278,6 +278,36 @@ def mcp_tool_names(tools: list[Any]) -> frozenset[str]:
     return frozenset(_tool_name(t) for t in tools if _tool_name(t))
 
 
+def _annotations_readonly(annotations: Any) -> bool:
+    if isinstance(annotations, dict):
+        return bool(annotations.get("readOnlyHint") is True or annotations.get("read_only_hint") is True)
+    return bool(getattr(annotations, "readOnlyHint", False) is True)
+
+
+def is_readonly_tool(tool: Any) -> bool:
+    """Return True when a tool explicitly declares read-only metadata or MCP ``readOnlyHint``."""
+    if tool is None or isinstance(tool, dict):
+        return False
+    metadata = getattr(tool, "metadata", None)
+    if isinstance(metadata, dict):
+        if metadata.get("read_only") is True or metadata.get("readOnlyHint") is True:
+            return True
+        if _annotations_readonly(metadata.get("annotations")):
+            return True
+    extras = getattr(tool, "extras", None)
+    if isinstance(extras, dict):
+        if extras.get("read_only") is True or extras.get("readOnlyHint") is True:
+            return True
+        if _annotations_readonly(extras.get("annotations")):
+            return True
+    return _annotations_readonly(getattr(tool, "annotations", None))
+
+
+def readonly_mcp_tool_names(tools: list[Any]) -> frozenset[str]:
+    """Return the subset of MCP tool names that explicitly advertise read-only behavior."""
+    return frozenset(_tool_name(t) for t in tools if _tool_name(t) and is_readonly_tool(t))
+
+
 def prioritize_active_mcp_tools(
     tools: list[Any],
     *,
@@ -393,6 +423,12 @@ def _postprocess_mcp_tools(
         # One wrap: optional aliases, then drop None before the MCP call.
         _wrap_tool_arguments(tool, aliases=aliases)
         _coerce_tool_args_schema(tool)
+        if is_readonly_tool(tool):
+            meta = getattr(tool, "metadata", None)
+            if meta is None:
+                tool.metadata = {"read_only": True}
+            elif isinstance(meta, dict) and meta.get("read_only") is not True:
+                tool.metadata = {**meta, "read_only": True}
         sanitized = sanitize_llm_tool_name(name)
         if sanitized == name:
             used_names.add(name)
@@ -480,11 +516,13 @@ def _coerce_tool_args_schema(tool: Any) -> None:
 __all__ = [
     "aload_mcp_tools",
     "filter_tools_for_mcp_servers",
+    "is_readonly_tool",
     "load_mcp_tools",
     "mcp_args_model",
     "mcp_tool_names",
     "merge_mcp_server_configs",
     "prioritize_active_mcp_tools",
+    "readonly_mcp_tool_names",
     "resolve_active_mcp_servers",
     "sanitize_llm_tool_name",
     "validate_mcp_default_servers",

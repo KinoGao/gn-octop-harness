@@ -45,6 +45,7 @@ from octop_harness.memory.policy import (
 from octop_harness.middleware.bootstrap import BootstrapMiddleware, bootstrap_marker_exists
 from octop_harness.middleware.checkpoint_ts import CheckpointTsMiddleware
 from octop_harness.middleware.context_usage import ContextUsageMiddleware
+from octop_harness.middleware.grounding import GroundingMiddleware
 from octop_harness.middleware.mcp_tool_error import McpToolErrorMiddleware
 from octop_harness.middleware.mcp_tools import MCPToolMiddleware
 from octop_harness.middleware.media_offload import MediaOffloadMiddleware
@@ -55,9 +56,12 @@ from octop_harness.middleware.model_settings import ModelSettingsMiddleware
 from octop_harness.middleware.pii import detect_pii
 from octop_harness.middleware.session_header import SessionHeaderMiddleware
 from octop_harness.middleware.skill_filter import SkillFilterMiddleware, render_slash_skill_prompt
+from octop_harness.middleware.summarization_limits import DeferredSummarizationToolMiddleware
 from octop_harness.middleware.tool_order import TaskToolLastMiddleware
+from octop_harness.middleware.tool_result_budget import ToolResultBudgetMiddleware
 from octop_harness.middleware.tool_search import ToolSearchMiddleware
 from octop_harness.middleware.tools_filter import ToolsFilterMiddleware
+from octop_harness.prompts import render_execution_discipline_prompt
 from octop_harness.protocols import resolve_protocol
 from octop_harness.request import ChatRequest
 
@@ -219,6 +223,7 @@ class HarnessAgent:
         self.on_bootstrap_complete: Callable[[], None] | None = None
         self._context_usage_mw: ContextUsageMiddleware | None = None
         self._summarization_mw: Any | None = None
+        self._compact_tool_mw: DeferredSummarizationToolMiddleware | None = None
 
         self._init_graph()
         self._init_protocols()
@@ -1676,17 +1681,7 @@ class HarnessAgent:
                 )
             )
 
-        # After MCP / user middleware may add or filter tools, and before tool
-        # search so ``tools_disabled`` names cannot leak into the search catalog.
-        from octop_harness.middleware.conversation_mode import ConversationModeMiddleware
-
-        chain.append(ConversationModeMiddleware())
-        chain.append(ToolsFilterMiddleware(config=cfg))
-
-        from octop_harness.middleware.task_reliability import TaskReliabilityMiddleware
-
-        chain.append(TaskReliabilityMiddleware())
-        chain.append(McpToolErrorMiddleware())
+        chain.extend(self._build_reliability_middleware())
 
         from octop_harness.decision import decision_active
 
@@ -1706,15 +1701,7 @@ class HarnessAgent:
         # Search only the final model-visible tool set. In particular, this
         # must run after MCP and user filtering so hidden tools cannot leak
         # into either the client or provider search inventory.
-        tool_search = self._build_tool_search_middleware()
-        if tool_search is not None:
-            chain.append(tool_search)
-
-        # Run after all harness/user middleware that may add or filter tools so
-        # the model sees ``task`` after the final shared tool set.
-        if cfg.task_tool_last:
-            chain.append(TaskToolLastMiddleware())
-
+        chain.extend(self._build_tail_middleware())
         chain.append(RefusalPassthroughMiddleware())
 
         # The refusal slot forwards the fully assembled outbound request for capture.
@@ -1730,6 +1717,49 @@ class HarnessAgent:
 
         return chain
 
+    def _build_reliability_middleware(self) -> list[Any]:
+        """Build compaction-tool, mode/tool filtering, reliability, grounding, and budget middleware."""
+        cfg = self._config
+        items: list[Any] = []
+        # Expose manual ``compact_conversation`` before mode/tool filtering so
+        # Ask/Plan mode and ``tools_disabled`` can govern it cleanly.
+        self._compact_tool_mw = None
+        if cfg.summarization_tool_enabled:
+            self._compact_tool_mw = DeferredSummarizationToolMiddleware()
+            items.append(self._compact_tool_mw)
+
+        from octop_harness.middleware.conversation_mode import ConversationModeMiddleware
+        from octop_harness.middleware.task_reliability import TaskReliabilityMiddleware
+
+        items.append(ConversationModeMiddleware())
+        items.append(ToolsFilterMiddleware(config=cfg))
+        items.append(TaskReliabilityMiddleware())
+        if cfg.grounding_enabled:
+            items.append(GroundingMiddleware())
+        if cfg.tool_result_max_tokens > 0:
+            items.append(
+                ToolResultBudgetMiddleware(
+                    max_tokens=cfg.tool_result_max_tokens,
+                    spill_dir=cfg.tool_result_spill_dir,
+                    workspace=self._workspace,
+                )
+            )
+        items.append(McpToolErrorMiddleware())
+        return items
+
+    def _build_tail_middleware(self) -> list[Any]:
+        """Build post-filtering tool search, task ordering, and rubric middleware."""
+        items: list[Any] = []
+        tool_search = self._build_tool_search_middleware()
+        if tool_search is not None:
+            items.append(tool_search)
+        if self._config.task_tool_last:
+            items.append(TaskToolLastMiddleware())
+        rubric_mw = self._build_rubric_middleware()
+        if rubric_mw is not None:
+            items.append(rubric_mw)
+        return items
+
     def _build_tool_search_middleware(self) -> Any | None:
         cfg = self._config
         deferred_tools = cfg.deferred_tools
@@ -1740,12 +1770,16 @@ class HarnessAgent:
             if cfg.media_generation.has_video_provider():
                 media_tools.add("generate_video")
             deferred_tools = deferred_tools | media_tools
-        if not (deferred_tools or cfg.defer_mcp_tools) or cfg.tool_search_mode == "eager":
+        auto_defer_mcp = (
+            cfg.defer_mcp_tools_threshold > 0 and len(self._mcp_tool_name_set) > cfg.defer_mcp_tools_threshold
+        )
+        if not (deferred_tools or cfg.defer_mcp_tools or auto_defer_mcp) or cfg.tool_search_mode == "eager":
             return None
         return ToolSearchMiddleware(
             deferred_tools=deferred_tools,
             mcp_tool_names=self._mcp_tool_name_set,
             defer_mcp_tools=cfg.defer_mcp_tools,
+            defer_mcp_tools_threshold=cfg.defer_mcp_tools_threshold,
             mode=cfg.tool_search_mode,
             fallback=cfg.tool_search_fallback,
         )
@@ -1783,9 +1817,51 @@ class HarnessAgent:
         else:
             self._init_graph()
 
+    def _build_rubric_middleware(self) -> Any | None:
+        """Build deepagents ``RubricMiddleware`` (zero-cost when a turn passes no rubric)."""
+        cfg = self._config
+        if not cfg.rubric_enabled:
+            return None
+        from deepagents.middleware.rubric import RubricMiddleware
+
+        grader_model = self._resolve_rubric_model()
+        return RubricMiddleware(
+            model=grader_model,
+            max_iterations=cfg.rubric_max_iterations,
+        )
+
+    def _resolve_rubric_model(self) -> Any:
+        cfg = self._config
+        spec = (cfg.rubric_model or "").strip()
+        if not spec and cfg.role_bindings:
+            spec = str(cfg.role_bindings.get("verifier") or "").strip()
+        if spec:
+            try:
+                ref = self._model_factory.resolve_ref(spec)
+                return self._model_factory.get_chat_model(ref)
+            except DEFENSIVE_OP_ERRORS:
+                logger.warning("Failed to resolve rubric_model %r; falling back to default model", spec, exc_info=True)
+        return self._build_seed_model()
+
+    def _resolve_subagent_model(self, raw_model: Any) -> Any:
+        """Resolve ``provider/model`` or role-binding names via ``ChatModelFactory``."""
+        if not isinstance(raw_model, str):
+            return raw_model
+        spec = raw_model.strip()
+        if not spec or ":" in spec:
+            return raw_model
+        bindings = self._config.role_bindings or {}
+        if "/" in spec or spec in bindings:
+            try:
+                ref = self._model_factory.resolve_ref(spec)
+                return self._model_factory.get_chat_model(ref)
+            except DEFENSIVE_OP_ERRORS:
+                logger.warning("Failed to resolve subagent model %r; keeping raw spec", spec, exc_info=True)
+        return raw_model
+
     def _resolve_subagents(self, *, parent_tools: list[Any] | None = None) -> list[Any]:
         """Merge workspace markdown subagents with config overrides."""
-        from octop_harness.mcp import filter_tools_for_mcp_servers
+        from octop_harness.mcp import filter_tools_for_mcp_servers, is_readonly_tool
         from octop_harness.subagents.loader import load_subagents_from_workspace, merge_subagents
 
         cfg = self._config
@@ -1798,13 +1874,11 @@ class HarnessAgent:
             parent_tools=parent_tools,
         )
         specs = merge_subagents(loaded, config_specs)
-        # Subagents do not inherit the parent's middleware chain, so the
-        # MCPToolMiddleware that hides MCP tools on the main agent never runs for
-        # them. Strip every MCP tool here at compile time so subagents match the
-        # main agent's default (MCP hidden) tool surface.
         mcp_names = self._mcp_tool_name_set
         server_names = frozenset(cfg.mcp_server_configs)
         for spec in specs:
+            if "model" in spec:
+                spec["model"] = self._resolve_subagent_model(spec["model"])
             # A subagent that omits ``tools:`` inherits the parent tool set; we
             # still resolve and reassign it so the gated set is pinned on the
             # spec instead of leaking the full compiled graph.
@@ -1815,16 +1889,32 @@ class HarnessAgent:
                 base: list[Any] = list(parent_tools)
             else:
                 base = list(raw)
-            spec["tools"] = filter_tools_for_mcp_servers(
+            non_mcp = filter_tools_for_mcp_servers(
                 base,
                 mcp_tool_names=mcp_names,
                 server_names=server_names,
                 active_servers=None,
             )
+            readonly_mcp: list[Any] = []
+            if cfg.subagent_inherit_readonly_mcp and mcp_names and server_names:
+                readonly_mcp = [t for t in base if _tool_name_of(t) in mcp_names and is_readonly_tool(t)]
+            combined = [*non_mcp, *readonly_mcp]
             # Subagents run as nested graphs without the parent's HITL config,
             # so an ``ask_user_question`` call there can never reach a human.
             # Hide it instead of letting them burn a turn on the fallback.
-            spec["tools"] = [t for t in spec["tools"] if _tool_name_of(t) != ASK_USER_TOOL_NAME]
+            spec["tools"] = [t for t in combined if _tool_name_of(t) != ASK_USER_TOOL_NAME]
+            if readonly_mcp and spec.get("mode") != "fork":
+                existing_mw = list(spec.get("middleware") or [])
+                if not any(isinstance(mw, MCPToolMiddleware) for mw in existing_mw):
+                    existing_mw.insert(
+                        0,
+                        MCPToolMiddleware(
+                            server_names=server_names,
+                            mcp_tool_names=frozenset(_tool_name_of(t) for t in readonly_mcp),
+                            default_servers=cfg.mcp_default_servers,
+                        ),
+                    )
+                    spec["middleware"] = existing_mw
         return specs
 
     def _build_graph(
@@ -1892,6 +1982,8 @@ class HarnessAgent:
             + "\n\n"
             + directive
             + "\n\n"
+            + render_execution_discipline_prompt(language=cfg.language)
+            + "\n\n"
             + render_memory_policy_prompt(
                 language=cfg.language,
                 memory_enabled=cfg.memory_enabled,
@@ -1946,6 +2038,8 @@ class HarnessAgent:
             graph = deepagents.create_deep_agent(**kwargs)
         if captured:
             self._summarization_mw = captured[-1]
+            if self._compact_tool_mw is not None:
+                self._compact_tool_mw.bind(self._summarization_mw)
         return graph
 
     def _build_seed_model(self) -> Any:

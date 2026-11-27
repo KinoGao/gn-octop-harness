@@ -33,6 +33,60 @@ _READ_TOOLS = frozenset(
     }
 )
 _STOP_OUTCOMES = frozenset({"authorization_required", "permission_required", "outcome_unknown", "rate_limited"})
+_FAILURE_REFLECTION_THRESHOLD = 3
+_MAX_UNFINISHED_TODOS_IN_NOTE = 5
+
+
+def _unfinished_todos(state: Mapping[str, Any]) -> list[dict[str, str]]:
+    raw = state.get("todos")
+    if not isinstance(raw, list):
+        return []
+    unfinished: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        status = str(item.get("status") or "").strip().lower()
+        content = str(item.get("content") or "").strip()
+        if status in {"pending", "in_progress"} and content:
+            unfinished.append({"status": status, "content": content[:160]})
+    return unfinished
+
+
+def _failure_reflection_hint(observations: Mapping[str, Any], turn: str) -> str:
+    """Return a reflection nudge when the current turn is stuck in repeated tool errors."""
+    current = [item for item in observations.values() if isinstance(item, Mapping) and item.get("turn") == turn]
+    if not current:
+        return ""
+    current.sort(key=lambda item: int(item.get("step", 0)))
+    trailing_failures = 0
+    for item in reversed(current):
+        if item.get("outcome") != "success":
+            trailing_failures += 1
+        else:
+            break
+    per_tool_failures: dict[str, int] = {}
+    for item in current:
+        if item.get("outcome") != "success":
+            tool = str(item.get("tool") or "")
+            if tool:
+                per_tool_failures[tool] = per_tool_failures.get(tool, 0) + 1
+    repeated_tools = sorted(
+        (name, count) for name, count in per_tool_failures.items() if count >= _FAILURE_REFLECTION_THRESHOLD
+    )
+    if trailing_failures < _FAILURE_REFLECTION_THRESHOLD and not repeated_tools:
+        return ""
+    reasons: list[str] = []
+    if trailing_failures >= _FAILURE_REFLECTION_THRESHOLD:
+        reasons.append(f"{trailing_failures} consecutive tool failures")
+    if repeated_tools:
+        summary = ", ".join(f"{name} ({count}x)" for name, count in repeated_tools)
+        reasons.append(f"repeated failures on {summary}")
+    return (
+        "Failure reflection required ("
+        + "; ".join(reasons)
+        + "): stop retrying similar calls. Summarize the root cause from prior errors, "
+        "re-read the relevant file or state, and switch strategy — or report the blocker clearly."
+    )
 
 
 def _merge_records(left: dict[str, Any] | None, right: dict[str, Any] | None) -> dict[str, Any]:
@@ -164,9 +218,15 @@ class TaskReliabilityMiddleware(AgentMiddleware[TaskReliabilityState, Any]):
         last_call = next((message for message in reversed(state["messages"]) if isinstance(message, AIMessage)), None)
         if last_call is not None and len(last_call.tool_calls) > 1:
             valid = False
+        unfinished = _unfinished_todos(state)
         error = ""
         if status == "completed" and not valid:
             error = "completion_unverified: cite successful readback/check tool_call_ids after the latest mutation."
+        elif status == "completed" and unfinished:
+            error = (
+                f"unfinished_todos: {len(unfinished)} todo item(s) remain pending/in_progress; "
+                "finish or reconcile them with write_todos before marking completed."
+            )
         elif status == "blocked" and not blocker.strip():
             error = "blocker_required: record what must change before continuing."
         elif status == "in_progress" and not next_step.strip():
@@ -214,6 +274,23 @@ class TaskReliabilityMiddleware(AgentMiddleware[TaskReliabilityState, Any]):
         if observations:
             note += "\nRecent tool observations: " + json.dumps(
                 dict(list(observations.items())[-8:]), ensure_ascii=False
+            )
+            reflection = _failure_reflection_hint(observations, _turn(state))
+            if reflection:
+                note += "\n" + reflection
+        unfinished = _unfinished_todos(state)
+        if unfinished:
+            preview = "; ".join(
+                f"[{item['status']}] {item['content']}" for item in unfinished[:_MAX_UNFINISHED_TODOS_IN_NOTE]
+            )
+            extra = (
+                f" (+{len(unfinished) - _MAX_UNFINISHED_TODOS_IN_NOTE} more)"
+                if len(unfinished) > _MAX_UNFINISHED_TODOS_IN_NOTE
+                else ""
+            )
+            note += (
+                f"\nUnfinished todos ({len(unfinished)}): {preview}{extra}. "
+                "Complete or reconcile them with write_todos before finishing your turn."
             )
         return request.override(messages=insert_turn_note(request.messages, note))
 

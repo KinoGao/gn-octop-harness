@@ -61,8 +61,10 @@ class ChatRequest:
     model: str | None = None
     mcp_servers: list[str] | None = None
     mcp_use_default: bool = False
+    allow_readonly_mcp_in_restricted_modes: bool = False
     skills: list[str] | None = None
     conversation_mode: str | None = None
+    rubric: str | None = None
     agent_id: str | None = None
     configurable: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
@@ -133,9 +135,14 @@ class ChatRequest:
             configurable["skills"] = list(self.skills)
         if self.conversation_mode is not None:
             configurable["conversation_mode"] = parse_conversation_mode(self.conversation_mode)
+        if self.rubric is not None and self.rubric.strip():
+            configurable["rubric"] = self.rubric.strip()
         if self.configurable:
             configurable.update(self.configurable)
-        _restrict_ask_plan_config(configurable)
+        _restrict_ask_plan_config(
+            configurable,
+            allow_readonly_mcp=self.allow_readonly_mcp_in_restricted_modes,
+        )
 
         config: dict[str, Any] = {"configurable": configurable}
         if self.metadata:
@@ -158,7 +165,11 @@ def _assign_if_not_none(target: dict[str, Any], **values: object) -> None:
             target[key] = value
 
 
-def _restrict_ask_plan_config(configurable: dict[str, Any]) -> None:
+def _restrict_ask_plan_config(
+    configurable: dict[str, Any],
+    *,
+    allow_readonly_mcp: bool = False,
+) -> None:
     from octop_harness.middleware.conversation_mode import parse_conversation_mode
 
     mode = parse_conversation_mode(configurable.get("conversation_mode"))
@@ -166,8 +177,9 @@ def _restrict_ask_plan_config(configurable: dict[str, Any]) -> None:
         return
     configurable["conversation_mode"] = mode
     configurable["skills"] = []
-    configurable["mcp_servers"] = []
-    configurable.pop("mcp_use_default", None)
+    if not allow_readonly_mcp:
+        configurable["mcp_servers"] = []
+        configurable.pop("mcp_use_default", None)
 
 
 _ROLE_TO_MESSAGE: dict[str, type[BaseMessage]] = {
