@@ -17,6 +17,7 @@ from octop_harness.request import ChatRequest
 
 if TYPE_CHECKING:
     from octop_harness.agent import HarnessAgent
+    from octop_harness.checkpoint import SnapshotSqliteSaver
     from octop_harness.init import InitResult, init_workspace
     from octop_harness.manager import AgentEntry, HarnessAgentManager
     from octop_harness.mcp_client import ManagedMCPClient
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "TaskReliabilityMiddleware": ("octop_harness.middleware.task_reliability", "TaskReliabilityMiddleware"),
+    "SnapshotSqliteSaver": ("octop_harness.checkpoint", "SnapshotSqliteSaver"),
     "ManagedMCPClient": ("octop_harness.mcp_client", "ManagedMCPClient"),
     "AgentEntry": ("octop_harness.manager", "AgentEntry"),
     "HarnessAgentManager": ("octop_harness.manager", "HarnessAgentManager"),
@@ -77,6 +79,7 @@ __all__ = [
     "ProviderConfig",
     "ProviderPreset",
     "SecurityPolicy",
+    "SnapshotSqliteSaver",
     "TaskReliabilityMiddleware",
     "__version__",
     "current_log_file",

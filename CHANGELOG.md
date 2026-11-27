@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### 新增
 
 - 默认安装 `TaskReliabilityMiddleware` 与 `task_checkpoint`：按会话保存目标、阻塞和下一步，压缩或从持久 checkpoint 重建后恢复提示；完成标记校验本轮真实、写后验收证据。限制相同失败调用，不自动重放结果不确定的写操作；提供六场景离线运行时契约评测。
+- 导出 `SnapshotSqliteSaver`：运行检查点仅在内存中处理，每次写入等待宿主持久化确认，支持从宿主快照恢复及连接可用性检查。
 
 ## [1.0.11] - 2026-11-17
 

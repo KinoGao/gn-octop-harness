@@ -161,6 +161,19 @@ Hosts can use `MemoryMiddleware.pause_background(timeout=120)` as a context mana
 
 Ordinary memory runtime shutdown stops accepting background work immediately and returns without waiting. The runtime retains its shared database claim until all accepted workers finish, including workers from middleware replaced during configuration changes. With no pending work, resources are released immediately. `MemoryMiddleware.shutdown(on_idle=callback)` lets resource owners receive the same completion signal; the callback runs once outside the worker lock, immediately when idle or on the last worker's thread. Shutdown does not keep the process alive; hosts that need to await workers should drain them before exiting.
 
+#### Host-owned checkpoints
+
+Hosts that keep conversation state on another device can pass
+`SnapshotSqliteSaver(load=load_image, save=save_image, validate=check_available)`
+as `HarnessAgentConfig.checkpointer`. It uses an in-memory SQLite working image,
+including pending writes for interrupts, and waits for the host's durable save
+after each write. Callbacks and construction are synchronous; async operations
+run in an executor. Recreate the saver after a failed write to reload the
+authoritative image. Set `session_log_enabled=False`,
+`memory_capture_enabled=False`, and `memory_extract_on_session_end=False` when
+the host also wants to avoid server-side transcript copies in session logs and
+automatic memory capture. Expert memory recall can remain enabled.
+
 #### Task progress and verification
 
 `HarnessAgent` installs `TaskReliabilityMiddleware` by default. Its
